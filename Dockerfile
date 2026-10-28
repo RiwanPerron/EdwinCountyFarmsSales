@@ -7,8 +7,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir poetry
 RUN poetry config virtualenvs.in-project true
 COPY pyproject.toml poetry.lock ./
-# Installation des dépendances de production uniquement (sans le package racine)
-RUN poetry install --no-dev --no-root --no-interaction --no-ansi
+# Modification ici : on utilise --without dev ou on retire --no-dev
+RUN poetry install --without dev --no-root --no-interaction --no-ansi
 
 FROM python:3.12-slim
 WORKDIR /app

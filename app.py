@@ -13,9 +13,9 @@ import openpyxl
 # Configuration & Constants
 # -----------------------------------------------------------------------------
 # Use the persistent storage directory on Fly.io, or fall back to local directory for development
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-DB_FILENAME = os.path.join(DATA_DIR, "/edwin_county_farms_sales.db")
-
+# S'assurer que le dossier de données existe
+os.makedirs("./data", exist_ok=True)
+DB_FILENAME = os.path.join("./data", "edwin_county_farms_sales.db")
 # Hardcoded CSV Column Mapping Fallbacks
 DEFAULT_COLUMN_MAPPINGS = {
     'date_fulfilled': ("Fulfillment Date", ['fulfillment date', 'fulfillment']),
@@ -445,20 +445,23 @@ with tab1:
         key="tab1_csv_uploader"
     )
 
+    df_raw = None
     if uploaded_tab1_csv is not None:
-        try:
-            df_raw = pd.read_csv(uploaded_tab1_csv)
-        except Exception:
-            uploaded_tab1_csv.seek(0)
-            try:
-                df_raw = pd.read_csv(uploaded_tab1_csv, encoding='utf-16', sep='\t')
-            except Exception:
-                uploaded_tab1_csv.seek(0)
-                df_raw = pd.read_csv(uploaded_tab1_csv, encoding='windows-1252', sep=';')
+        # Sauvegarde locale du fichier uploadé
+        local_csv_path = os.path.join("./data", uploaded_tab1_csv.name)
+        with open(local_csv_path, "wb") as f:
+            f.write(uploaded_tab1_csv.getbuffer())
 
-        # --- Continue with your existing column resolution and pending logic below ---
-        cols = list(df_raw.columns)
-        # ... rest of your Tab 1 code ...
+        st.success(f"Fichier sauvegardé localement : `{local_csv_path}`")
+
+        # Lecture du fichier depuis le chemin local
+        try:
+            df_raw = pd.read_csv(local_csv_path)
+        except Exception:
+            try:
+                df_raw = pd.read_csv(local_csv_path, encoding='utf-16', sep='\t')
+            except Exception:
+                df_raw = pd.read_csv(local_csv_path, encoding='windows-1252', sep=';')
     else:
         st.info("Please upload a CSV file above to review and validate pending sales orders.")
 
