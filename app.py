@@ -13,8 +13,8 @@ import openpyxl
 # Configuration & Constants
 # -----------------------------------------------------------------------------
 # Use the persistent storage directory on Fly.io, or fall back to local directory for development
-DATA_DIR = os.getenv("DATA_DIR", ".")
-DB_FILENAME = os.path.join(DATA_DIR, "data/edwin_county_farms_sales.db")
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+DB_FILENAME = os.path.join(DATA_DIR, "/edwin_county_farms_sales.db")
 
 # Hardcoded CSV Column Mapping Fallbacks
 DEFAULT_COLUMN_MAPPINGS = {
@@ -898,7 +898,7 @@ with tab1:
                         except Exception as e:
                             st.error(f"Error saving to database: {e}")
     else:
-        st.error(f"Could not find `{CSV_FILENAME}`. Please verify the file is in the same directory as this script.")
+        st.error(f"Could not find data. Please verify the file is in the same directory as this script.")
 
 # =============================================================================
 # TAB 2: SALES ANALYSIS DASHBOARD
