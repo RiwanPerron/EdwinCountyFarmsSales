@@ -1,29 +1,19 @@
-FROM python:3.12-slim
+FROM python:3.12 AS builder
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    software-properties-common \
-    && rm -rf /var/lib/apt-get/lists/*
+RUN pip install --no-cache-dir poetry
+RUN poetry config virtualenvs.in-project true
+COPY pyproject.toml poetry.lock ./
+# Installation des dépendances de production uniquement (sans le package racine)
+RUN poetry install --no-dev --no-root --no-interaction --no-ansi
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application source code
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /app/.venv .venv/
 COPY . .
 
-# Create the data directory for SQLite persistence
-RUN mkdir -p /data
-
-# Set Environment Variables for Streamlit & Database location
-ENV DATA_DIR="/data"
-ENV STREAMLIT_SERVER_PORT=8501
-ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
-
-EXPOSE 8501
-
-CMD ["streamlit", "run", "app.py"]
+EXPOSE 8085
+CMD ["/app/.venv/bin/streamlit", "run", "app.py", "--server.port=8085", "--server.address=0.0.0.0"]
