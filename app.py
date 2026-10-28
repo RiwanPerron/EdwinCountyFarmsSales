@@ -14,7 +14,7 @@ import openpyxl
 # -----------------------------------------------------------------------------
 # Use the persistent storage directory on Fly.io, or fall back to local directory for development
 DATA_DIR = os.getenv("DATA_DIR", ".")
-DB_FILENAME = os.path.join(DATA_DIR, "edwin_county_farms_sales.db")
+DB_FILENAME = os.path.join(DATA_DIR, "data/edwin_county_farms_sales.db")
 
 # Hardcoded CSV Column Mapping Fallbacks
 DEFAULT_COLUMN_MAPPINGS = {
