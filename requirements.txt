@@ -1,4 +1,5 @@
-streamlit
-pandas
-altair
-openpyxl
+streamlit>=1.40.1
+pandas>=2.2.3
+altair>=5.4.1
+openpyxl>=3.1.5
+mysql-connector-python>=9.1.0
