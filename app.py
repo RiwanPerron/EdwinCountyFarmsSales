@@ -461,6 +461,35 @@ def merge_dialog(selected_df):
             st.error(f"Error merging products: {e}")
 
 
+@st.dialog("Merge Customers")
+def merge_customers_dialog(selected_df):
+    st.warning("Merging will update all historical orders and sales to point to the selected primary customer. The merged customer(s) will be permanently deleted.")
+
+    st.write("Selected Customers to Merge:")
+    st.dataframe(selected_df[['CustomerID', 'Name']], hide_index=True)
+
+    keep_options = selected_df['CustomerID'].astype(str) + " - " + selected_df['Name']
+    target_selection = st.selectbox("Which customer do you want to KEEP as primary?", keep_options.tolist())
+
+    if st.button("🚨 Confirm Customer Merge", type="primary", use_container_width=True):
+        target_cid = int(target_selection.split(" - ", 1)[0])
+        other_cids = [int(cid) for cid in selected_df[selected_df['CustomerID'] != target_cid]['CustomerID'].tolist()]
+
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                placeholders = ','.join(['?'] * len(other_cids))
+
+                cursor.execute(f"UPDATE Orders SET CustomerID = ? WHERE CustomerID IN ({placeholders})", [target_cid] + other_cids)
+                cursor.execute(f"DELETE FROM Customers WHERE CustomerID IN ({placeholders})", other_cids)
+                conn.commit()
+
+            st.success("Customers merged successfully!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error merging customers: {e}")
+
+
 @st.dialog("Define New Products", width="large")
 def define_new_products_dialog(import_names):
     st.write("Please set the properties for the newly mapped products below:")
@@ -489,7 +518,6 @@ def define_new_products_dialog(import_names):
                 get_or_create_product(clean_pid, clean_pname, punit.strip(), pcat.strip(), psub.strip())
                 save_product_mapping(csv_name, clean_pid)
 
-                # Update session state
                 display_str = f"{clean_pid} - {clean_pname}"
                 mask = st.session_state["market_draft_df"]["ImportName"] == csv_name
                 st.session_state["market_draft_df"].loc[mask, "Selected DB Product"] = display_str
@@ -513,16 +541,17 @@ tab_titles = [
     "📝 Sales Entry & Validation",
     "📊 Sales Analysis Dashboard",
     "🥬 Product Management",
+    "👥 Customer Management",
     "📦 Order Management"
 ]
 
 if is_local:
-    tab1, tab2, tab3, tab4 = st.tabs(tab_titles)
+    tab1, tab2, tab3, tab_cust, tab4 = st.tabs(tab_titles)
 else:
     # Public online view restrictions
     tabs = st.tabs(["📊 Sales Analysis Dashboard"])
     tab2 = tabs[0]
-    tab1, tab3, tab4 = None, None, None
+    tab1, tab3, tab_cust, tab4 = None, None, None, None, None
 
 
 # =============================================================================
@@ -571,6 +600,21 @@ if is_local and tab1:
             qty_col = resolve_column(cols, *DEFAULT_COLUMN_MAPPINGS['qty'])
             subtotal_col = resolve_column(cols, *DEFAULT_COLUMN_MAPPINGS['subtotal'])
             total_col = resolve_column(cols, *DEFAULT_COLUMN_MAPPINGS['total'])
+
+            # Fill missing optional columns with sensible defaults to prevent KeyErrors
+            defaults = {
+                order_status_col: "Fulfilled",
+                category_col: "Uncategorized",
+                sub_category_col: "Uncategorized",
+                item_unit_col: "each",
+                num_items_col: 1.0,
+                qty_col: 1.0,
+                subtotal_col: 0.0,
+                total_col: 0.0,
+            }
+            for col_name, default_val in defaults.items():
+                if col_name not in df_raw.columns:
+                    df_raw[col_name] = default_val
 
             registered_db_orders = get_registered_order_ids()
             valid_df = df_raw[~df_raw[order_status_col].astype(str).str.upper().str.contains('CANCEL', na=False)].copy()
@@ -931,295 +975,273 @@ if is_local and tab1:
 
 
 # =============================================================================
-# TAB 2: SALES ANALYSIS DASHBOARD
+# TAB 2: SALES ANALYSIS & PLANNING DASHBOARD
 # =============================================================================
 with tab2:
-    st.header("📈 Sales Analytics & Planning Dashboard")
+    st.header("📈 Sales Analytics")
 
     analytics_df = load_sales_analytics_data()
 
     if analytics_df.empty:
-        st.info("No sales records found in the database yet. Validate and save orders in Tab 1 or Tab 4 to view analytics.")
+        st.info("No sales records found in the database yet. Validate and save orders in Tab 1 or Tab 5 to view analytics.")
     else:
-        subtab1, subtab2 = st.tabs(["📊 General Dashboard", "📅 YoY Comparison & Planning"])
-
         # ---------------------------------------------------------------------
-        # SUB-TAB 2.1: GENERAL DASHBOARD
+        # GLOBAL FILTERS (YoY & Seasonal Controls)
         # ---------------------------------------------------------------------
-        with subtab1:
-            st.subheader("Filter Analytics by Period")
+        st.subheader("🔍 Filter Analytics")
 
-            f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns(5)
+        month_options = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ]
 
-            min_date = analytics_df['FulfillmentDateObj'].min() or datetime.date.today()
-            max_date = analytics_df['FulfillmentDateObj'].max() or datetime.date.today()
+        selected_months = st.multiselect(
+            "Filter by Month(s)",
+            options=month_options,
+            default=month_options,
+            key="yoy_months_multiselect"
+        )
 
-            date_selection = f_col1.date_input(
-                "Select Date Range",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date,
-                key="gen_date_range"
-            )
-            if isinstance(date_selection, tuple):
-                start_date = date_selection[0] if len(date_selection) >= 1 else min_date
-                end_date = date_selection[1] if len(date_selection) == 2 else start_date
-            else:
-                start_date = end_date = date_selection
+        def map_to_dummy_year(date_obj):
+            if pd.isna(date_obj):
+                return pd.NaT
+            if date_obj.month == 2 and date_obj.day == 29:
+                return datetime.date(2024, 2, 29)
+            return datetime.date(2024, date_obj.month, date_obj.day)
 
-            selected_categories = f_col2.multiselect("Filter by Category", sorted(analytics_df['Category'].unique()), default="Produce", key="gen_cat_multi")
-            selected_subcategories = f_col3.multiselect("Filter by Sub-Category", sorted(analytics_df['SubCategory'].dropna().unique()), key="gen_subcat_multi")
-            selected_customers = f_col4.multiselect("Filter by Customer", sorted(analytics_df['CustomerName'].unique()), key="gen_cust_multi")
-            selected_products = f_col5.multiselect("Filter by Product", sorted(analytics_df['ProductName'].unique()), key="gen_prod_multi")
+        yoy_base_df = analytics_df.copy()
+        yoy_base_df['MonthName'] = yoy_base_df['FulfillmentDatetime'].dt.month_name()
+        yoy_base_df['DummyDate'] = yoy_base_df['FulfillmentDateObj'].apply(map_to_dummy_year)
 
-            filtered_df = analytics_df[
-                (analytics_df['FulfillmentDateObj'] >= start_date) & (analytics_df['FulfillmentDateObj'] <= end_date)
-            ]
+        # Base filter by selected months
+        yoy_filtered = yoy_base_df[yoy_base_df['MonthName'].isin(selected_months)]
 
-            if selected_customers:
-                filtered_df = filtered_df[filtered_df['CustomerName'].isin(selected_customers)]
-            if selected_categories:
-                filtered_df = filtered_df[filtered_df['Category'].isin(selected_categories)]
-            if selected_subcategories:
-                filtered_df = filtered_df[filtered_df['SubCategory'].isin(selected_subcategories)]
-            if selected_products:
-                filtered_df = filtered_df[filtered_df['ProductName'].isin(selected_products)]
+        pf_col1, pf_col2, pf_col3, pf_col4, pf_col5 = st.columns(5)
 
-            st.caption(f"Showing **{len(filtered_df)}** sales line items matching current filters.")
-            st.divider()
+        available_years = sorted(yoy_filtered['Year'].unique().tolist(), reverse=True)
+        filter_yoy_years = pf_col1.multiselect("Select Years to Compare", available_years, default=available_years, key="yoy_year")
+        filter_yoy_cats = pf_col2.multiselect("Filter by Category", sorted(yoy_filtered['Category'].unique()), default="Produce", key="yoy_cat")
+        filter_yoy_subcats = pf_col3.multiselect("Filter by Sub-Category", sorted(yoy_filtered['SubCategory'].unique()), default=[], key="yoy_subcat")
+        filter_yoy_custs = pf_col4.multiselect("Filter by Customer", sorted(yoy_filtered['CustomerName'].unique()), default=[], key="yoy_cust")
+        filter_yoy_prods = pf_col5.multiselect("Filter by Product", sorted(yoy_filtered['ProductName'].unique()), default=[], key="yoy_prod")
 
+        if filter_yoy_years:
+            yoy_filtered = yoy_filtered[yoy_filtered['Year'].isin(filter_yoy_years)]
+        if filter_yoy_cats:
+            yoy_filtered = yoy_filtered[yoy_filtered['Category'].isin(filter_yoy_cats)]
+        if filter_yoy_subcats:
+            yoy_filtered = yoy_filtered[yoy_filtered['SubCategory'].isin(filter_yoy_subcats)]
+        if filter_yoy_custs:
+            yoy_filtered = yoy_filtered[yoy_filtered['CustomerName'].isin(filter_yoy_custs)]
+        if filter_yoy_prods:
+            yoy_filtered = yoy_filtered[yoy_filtered['ProductName'].isin(filter_yoy_prods)]
+
+        st.caption(f"Showing **{len(yoy_filtered)}** sales line items matching current filters.")
+        st.divider()
+
+        if yoy_filtered.empty:
+            st.warning("No sales found for the selected filter criteria.")
+        else:
+            # ---------------------------------------------------------------------
+            # KEY METRICS CARDS
+            # ---------------------------------------------------------------------
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Revenue", f"${filtered_df['SalePrice'].sum():,.2f}")
-            col2.metric("Total Units Sold", f"{filtered_df['BaseQuantitySold'].sum():,.1f}")
-            col3.metric("Total Orders", f"{filtered_df['OrderID'].nunique():,}")
-            col4.metric("Unique Customers", f"{filtered_df['CustomerName'].nunique():,}")
+            col1.metric("Total Revenue", f"${yoy_filtered['SalePrice'].sum():,.2f}")
+            col2.metric("Total Units Sold", f"{yoy_filtered['BaseQuantitySold'].sum():,.1f}")
+            col3.metric("Total Orders", f"{yoy_filtered['OrderID'].nunique():,}")
+            col4.metric("Unique Customers", f"{yoy_filtered['CustomerName'].nunique():,}")
 
             st.divider()
 
-            chart_col1, chart_col2 = st.columns(2)
-            with chart_col1:
-                st.subheader("Revenue by Customer ($)")
-                if not filtered_df.empty:
-                    cust_rev = filtered_df.groupby('CustomerName')['SalePrice'].sum().reset_index().sort_values(by='SalePrice', ascending=False).set_index('CustomerName')
-                    st.bar_chart(cust_rev)
+            # ---------------------------------------------------------------------
+            # 1. TIMELINE TREND CHART
+            # ---------------------------------------------------------------------
+            target_col = 'SalePrice'
+            yoy_metric = "Revenue ($)"
 
-            with chart_col2:
-                st.subheader("Revenue by Category ($)")
-                if not filtered_df.empty:
-                    cat_rev = filtered_df.groupby('Category')['SalePrice'].sum().reset_index().sort_values(by='SalePrice', ascending=False).set_index('Category')
-                    st.bar_chart(cat_rev)
-
-            st.divider()
-
-            st.subheader("📦 Product-Level Sales Summary")
-            if not filtered_df.empty:
-                group_by_subcat = st.checkbox("Group summary by Sub-Category", value=False, key="group_by_subcat_toggle")
-
-                working_df = filtered_df.copy()
-                working_df['EffectiveSubCategory'] = working_df.apply(resolve_effective_subcategory, axis=1)
-
-                if group_by_subcat:
-                    product_summary = working_df.groupby(['Category', 'EffectiveSubCategory']).agg(
-                        ProductName=('ProductName', lambda x: f"{x.nunique()} product(s)" if x.nunique() > 1 else x.iloc[0]),
-                        Total_Base_Quantity_Sold=('BaseQuantitySold', 'sum'),
-                        Total_Revenue=('SalePrice', 'sum'),
-                        Times_Ordered=('OrderID', 'nunique')
-                    ).reset_index().rename(columns={'EffectiveSubCategory': 'SubCategory'}).sort_values(by='Total_Revenue', ascending=False)
-                    filename_suffix = "sub_category_summary"
-                else:
-                    product_summary = working_df.groupby(['ProductID', 'ProductName', 'Category', 'SubCategory', 'BaseUnit']).agg(
-                        Total_Base_Quantity_Sold=('BaseQuantitySold', 'sum'),
-                        Total_Revenue=('SalePrice', 'sum'),
-                        Times_Ordered=('OrderID', 'nunique')
-                    ).reset_index().sort_values(by='Total_Revenue', ascending=False)
-                    filename_suffix = "product_summary"
-
-                st.dataframe(product_summary, use_container_width=True)
-
-                st.download_button(
-                    label="📥 Download Summary as CSV",
-                    data=product_summary.to_csv(index=False).encode('utf-8'),
-                    file_name=f"edwin_county_farms_{filename_suffix}_{start_date}_to_{end_date}.csv",
-                    mime="text/csv"
-                )
-
-                st.divider()
-                st.subheader("📅 Export Weekly Sales to Excel")
-                export_metric = st.radio("Select metric to aggregate in export:", ["Revenue ($)", "Quantity (Units)"], horizontal=True, key="excel_export_metric")
-
-                metric_col = 'SalePrice' if 'Revenue' in export_metric else 'BaseQuantitySold'
-                pivot_df = pd.pivot_table(
-                    filtered_df,
-                    values=metric_col,
-                    index=['Category', 'SubCategory', 'ProductID', 'ProductName'],
-                    columns='Week',
-                    aggfunc='sum',
-                    fill_value=0
-                ).reset_index()
-
-                excel_buffer = io.BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                    pivot_df.to_excel(writer, index=False, sheet_name='Weekly Sales')
-
-                st.download_button(
-                    label="📥 Download Weekly Sales Export (.xlsx)",
-                    data=excel_buffer.getvalue(),
-                    file_name=f"Weekly_Sales_Export_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-        # ---------------------------------------------------------------------
-        # SUB-TAB 2.2: YoY COMPARISON & PLANNING
-        # ---------------------------------------------------------------------
-        with subtab2:
-            st.subheader("📅 YoY Crop & Sales Planning")
-            st.write("Select a specific 'Season Window' to directly compare sales metrics (e.g., April 1st to May 12th) across different years.")
-
-            st.markdown("##### 1. Define Season Window")
-            p_col1, p_col2 = st.columns(2)
-            season_start = p_col1.date_input(
-                "Start of Window (Year is ignored)",
-                value=datetime.date(2024, 4, 1),
-                min_value=datetime.date(2024, 1, 1),
-                max_value=datetime.date(2024, 12, 31),
-                key="yoy_start_date"
-            )
-            season_end = p_col2.date_input(
-                "End of Window (Year is ignored)",
-                value=datetime.date(2024, 5, 12),
-                min_value=datetime.date(2024, 1, 1),
-                max_value=datetime.date(2024, 12, 31),
-                key="yoy_end_date"
+            st.markdown("#### 📈 Revenue ($) Timeline Trend")
+            time_view = st.radio(
+                "Aggregate Timeline By:",
+                ["Daily", "Weekly", "Monthly"],
+                index=1,  # Default to Weekly
+                horizontal=True,
+                key="yoy_time_agg"
             )
 
-            def map_to_dummy_year(date_obj):
-                if pd.isna(date_obj):
-                    return pd.NaT
-                if date_obj.month == 2 and date_obj.day == 29:
-                    return datetime.date(2024, 2, 29)
-                return datetime.date(2024, date_obj.month, date_obj.day)
+            trend_base_df = yoy_filtered.copy()
+            if time_view == "Daily":
+                trend_base_df['PeriodStart'] = trend_base_df['DummyDate']
+            elif time_view == "Weekly":
+                trend_base_df['PeriodStart'] = pd.to_datetime(trend_base_df['DummyDate']) - pd.to_timedelta(
+                    pd.to_datetime(trend_base_df['DummyDate']).dt.weekday, unit='d')
+                trend_base_df['PeriodStart'] = trend_base_df['PeriodStart'].dt.date
+            elif time_view == "Monthly":
+                trend_base_df['PeriodStart'] = pd.to_datetime(trend_base_df['DummyDate']).apply(
+                    lambda x: datetime.date(x.year, x.month, 1))
 
-            yoy_base_df = analytics_df.copy()
-            yoy_base_df['DummyDate'] = yoy_base_df['FulfillmentDateObj'].apply(map_to_dummy_year)
+            agg_df = trend_base_df.groupby(['Year', 'PeriodStart'])[target_col].sum().reset_index()
+            agg_df['YearLabel'] = agg_df['Year'].astype(str)
 
-            yoy_filtered = yoy_base_df[
-                (yoy_base_df['DummyDate'] >= season_start) & (yoy_base_df['DummyDate'] <= season_end)
-            ]
-
-            st.markdown("##### 2. Apply Custom Filters")
-            pf_col1, pf_col2, pf_col3, pf_col4, pf_col5 = st.columns(5)
-
-            available_years = sorted(yoy_filtered['Year'].unique().tolist(), reverse=True)
-            filter_yoy_years = pf_col1.multiselect("Select Years to Compare", available_years, default=available_years, key="yoy_year")
-            filter_yoy_cats = pf_col2.multiselect("Filter by Category", sorted(yoy_filtered['Category'].unique()), default="Produce", key="yoy_cat")
-            filter_yoy_subcats = pf_col3.multiselect("Filter by Sub-Category", sorted(yoy_filtered['SubCategory'].unique()), default=[], key="yoy_subcat")
-            filter_yoy_custs = pf_col4.multiselect("Filter by Customer", sorted(yoy_filtered['CustomerName'].unique()), default=[], key="yoy_cust")
-            filter_yoy_prods = pf_col5.multiselect("Filter by Product", sorted(yoy_filtered['ProductName'].unique()), default=[], key="yoy_prod")
-
-            if filter_yoy_years:
-                yoy_filtered = yoy_filtered[yoy_filtered['Year'].isin(filter_yoy_years)]
-            if filter_yoy_cats:
-                yoy_filtered = yoy_filtered[yoy_filtered['Category'].isin(filter_yoy_cats)]
-            if filter_yoy_subcats:
-                yoy_filtered = yoy_filtered[yoy_filtered['SubCategory'].isin(filter_yoy_subcats)]
-            if filter_yoy_custs:
-                yoy_filtered = yoy_filtered[yoy_filtered['CustomerName'].isin(filter_yoy_custs)]
-            if filter_yoy_prods:
-                yoy_filtered = yoy_filtered[yoy_filtered['ProductName'].isin(filter_yoy_prods)]
-
-            st.divider()
-
-            if yoy_filtered.empty:
-                st.warning("No sales found for the selected season window and filters.")
+            if time_view == "Monthly":
+                agg_df['FullDateLabel'] = pd.to_datetime(agg_df['PeriodStart']).dt.strftime('%B')
+                axis_format = '%B'
             else:
-                yoy_metric = st.radio("Compare Metrics Using:", ["Quantity (Units)", "Revenue ($)"], horizontal=True, key="yoy_metric_radio")
-                target_col = 'BaseQuantitySold' if 'Quantity' in yoy_metric else 'SalePrice'
+                agg_df['FullDateLabel'] = pd.to_datetime(agg_df['PeriodStart']).dt.strftime('%d-%b')
+                axis_format = '%b %d'
 
-                st.markdown(f"#### 📈 {yoy_metric} Timeline Trend")
-                time_view = st.radio("Aggregate Timeline By:", ["Daily", "Weekly", "Monthly"], horizontal=True, key="yoy_time_agg")
+            line_chart = alt.Chart(agg_df).mark_line(point=True).encode(
+                x=alt.X('PeriodStart:T', title='Time of Year', axis=alt.Axis(format=axis_format)),
+                y=alt.Y(f'{target_col}:Q', title=yoy_metric),
+                color=alt.Color('YearLabel:N', title='Year'),
+                tooltip=['FullDateLabel:N', alt.Tooltip(f'{target_col}:Q', format=',.2f'), 'YearLabel:N']
+            ).interactive()
 
-                trend_base_df = yoy_filtered.copy()
-                if time_view == "Daily":
-                    trend_base_df['PeriodStart'] = trend_base_df['DummyDate']
-                elif time_view == "Weekly":
-                    trend_base_df['PeriodStart'] = pd.to_datetime(trend_base_df['DummyDate']) - pd.to_timedelta(
-                        pd.to_datetime(trend_base_df['DummyDate']).dt.weekday, unit='d')
-                    trend_base_df['PeriodStart'] = trend_base_df['PeriodStart'].dt.date
-                elif time_view == "Monthly":
-                    trend_base_df['PeriodStart'] = pd.to_datetime(trend_base_df['DummyDate']).apply(
-                        lambda x: datetime.date(x.year, x.month, 1))
+            st.altair_chart(line_chart, use_container_width=True)
 
-                agg_df = trend_base_df.groupby(['Year', 'PeriodStart'])[target_col].sum().reset_index()
-                agg_df['YearLabel'] = agg_df['Year'].astype(str)
+            st.divider()
 
-                if time_view == "Monthly":
-                    agg_df['FullDateLabel'] = pd.to_datetime(agg_df['PeriodStart']).dt.strftime('%B')
-                    axis_format = '%B'
-                else:
-                    agg_df['FullDateLabel'] = pd.to_datetime(agg_df['PeriodStart']).dt.strftime('%d-%b')
-                    axis_format = '%b %d'
+            # ---------------------------------------------------------------------
+            # 2. REVENUE BY CUSTOMER CHART (TOP N FILTERED - ALWAYS SHOW LABELS)
+            # ---------------------------------------------------------------------
+            chart_col1, chart_col2 = st.columns(2)
 
-                chart = alt.Chart(agg_df).mark_line(point=True).encode(
-                    x=alt.X('PeriodStart:T', title='Time of Year', axis=alt.Axis(format=axis_format)),
-                    y=alt.Y(f'{target_col}:Q', title=yoy_metric),
-                    color=alt.Color('YearLabel:N', title='Year'),
-                    tooltip=['FullDateLabel:N', alt.Tooltip(f'{target_col}:Q', format=',.2f'), 'YearLabel:N']
-                ).interactive()
+            with chart_col1:
+                st.markdown("#### 👥 Revenue by Customer ($)")
+                total_cust_count = yoy_filtered['CustomerName'].nunique()
+                top_n_custs = st.number_input(
+                    "Show Top N Customers",
+                    min_value=1,
+                    max_value=max(total_cust_count, 1),
+                    value=min(5, max(total_cust_count, 1)),
+                    step=1,
+                    key="top_n_customers_input"
+                )
 
-                st.altair_chart(chart, use_container_width=True)
+                # Order customers by total revenue across selected period
+                cust_totals = yoy_filtered.groupby('CustomerName')['SalePrice'].sum().nlargest(top_n_custs)
+                top_customer_names = cust_totals.index.tolist()
 
-                st.divider()
-                st.markdown(f"#### 📊 Product Comparison: {season_start.strftime('%B %d')} to {season_end.strftime('%B %d')}")
+                cust_chart_df = yoy_filtered[yoy_filtered['CustomerName'].isin(top_customer_names)].groupby(['CustomerName', 'Year'])['SalePrice'].sum().reset_index()
+                cust_chart_df['YearStr'] = cust_chart_df['Year'].astype(str)
+                cust_chart_df['CustomerName'] = pd.Categorical(cust_chart_df['CustomerName'], categories=top_customer_names, ordered=True)
 
-                chart_df = yoy_filtered.groupby(['ProductName', 'Year'])[target_col].sum().reset_index()
-                chart_df['YearStr'] = chart_df['Year'].astype(str)
-
-                yoy_chart = alt.Chart(chart_df).mark_bar().encode(
-                    x=alt.X('ProductName:N', title='Product', axis=alt.Axis(labelAngle=-45, labelLimit=250)),
+                cust_chart = alt.Chart(cust_chart_df).mark_bar().encode(
+                    x=alt.X(
+                        'CustomerName:N',
+                        title='Customer',
+                        sort=top_customer_names,
+                        axis=alt.Axis(labelAngle=-45, labelLimit=300, labelOverlap=False)
+                    ),
                     xOffset='YearStr:N',
-                    y=alt.Y(f'{target_col}:Q', title=yoy_metric),
+                    y=alt.Y('SalePrice:Q', title='Revenue ($)'),
                     color=alt.Color('YearStr:N', title='Year'),
-                    tooltip=['ProductName:N', 'YearStr:N', alt.Tooltip(f'{target_col}:Q', format=',.2f')]
+                    tooltip=['CustomerName:N', 'YearStr:N', alt.Tooltip('SalePrice:Q', format=',.2f')]
                 ).configure_view(stroke='transparent')
 
-                st.altair_chart(yoy_chart, use_container_width=True)
+                st.altair_chart(cust_chart, use_container_width=True)
 
-                st.write("###### Data Matrix")
-                group_yoy_matrix_subcat = st.checkbox("Group matrix by Sub-Category", value=False, key="yoy_matrix_subcat_toggle")
+            # ---------------------------------------------------------------------
+            # 3. PRODUCT / SUB-CATEGORY REVENUE COMPARISON CHART (TOP N FILTERED)
+            # ---------------------------------------------------------------------
+            with chart_col2:
+                st.markdown("#### 🥬 Product Revenue Comparison")
 
-                yoy_matrix_df = yoy_filtered.copy()
-                yoy_matrix_df['EffectiveSubCategory'] = yoy_matrix_df.apply(resolve_effective_subcategory, axis=1)
-
-                if group_yoy_matrix_subcat:
-                    pivot_index = ['Category', 'EffectiveSubCategory']
-                    index_names = ['Category', 'SubCategory']
-                else:
-                    pivot_index = ['Category', 'EffectiveSubCategory', 'ProductName']
-                    index_names = ['Category', 'SubCategory', 'ProductName']
-
-                yoy_pivot = pd.pivot_table(
-                    yoy_matrix_df,
-                    values=target_col,
-                    index=pivot_index,
-                    columns='Year',
-                    aggfunc='sum',
-                    fill_value=0
+                group_by_subcat_chart = st.checkbox(
+                    "Group by Sub-Category",
+                    value=True,
+                    key="prod_chart_subcat_toggle"
                 )
-                yoy_pivot.index.names = index_names
 
-                if not yoy_pivot.empty:
-                    col_sums = yoy_pivot.sum(numeric_only=True)
-                    if group_yoy_matrix_subcat:
-                        total_index = pd.MultiIndex.from_tuples([("TOTAL", "")], names=index_names)
-                    else:
-                        total_index = pd.MultiIndex.from_tuples([("TOTAL", "", "")], names=index_names)
+                yoy_filtered_chart = yoy_filtered.copy()
+                yoy_filtered_chart['EffectiveSubCategory'] = yoy_filtered_chart.apply(resolve_effective_subcategory, axis=1)
 
-                    total_df = pd.DataFrame([col_sums], index=total_index)
-                    yoy_pivot_with_total = pd.concat([yoy_pivot, total_df])
-                else:
-                    yoy_pivot_with_total = yoy_pivot
+                group_col = 'EffectiveSubCategory' if group_by_subcat_chart else 'ProductName'
+                group_title = 'Sub-Category' if group_by_subcat_chart else 'Product'
 
-                st.dataframe(yoy_pivot_with_total, use_container_width=True)
+                total_prod_count = yoy_filtered_chart[group_col].nunique()
+                top_n_prods = st.number_input(
+                    f"Show Top N {group_title}s",
+                    min_value=1,
+                    max_value=max(total_prod_count, 1),
+                    value=min(5, max(total_prod_count, 1)),
+                    step=1,
+                    key="top_n_products_input"
+                )
+
+                # Order items by total revenue across selected period
+                prod_totals = yoy_filtered_chart.groupby(group_col)['SalePrice'].sum().nlargest(top_n_prods)
+                top_prod_names = prod_totals.index.tolist()
+
+                prod_chart_df = yoy_filtered_chart[yoy_filtered_chart[group_col].isin(top_prod_names)].groupby([group_col, 'Year'])['SalePrice'].sum().reset_index()
+                prod_chart_df['YearStr'] = prod_chart_df['Year'].astype(str)
+                prod_chart_df[group_col] = pd.Categorical(prod_chart_df[group_col], categories=top_prod_names, ordered=True)
+
+                yoy_prod_chart = alt.Chart(prod_chart_df).mark_bar().encode(
+                    x=alt.X(
+                        f'{group_col}:N',
+                        title=group_title,
+                        sort=top_prod_names,
+                        axis=alt.Axis(labelAngle=-45, labelLimit=300, labelOverlap=False)
+                    ),
+                    xOffset='YearStr:N',
+                    y=alt.Y('SalePrice:Q', title='Revenue ($)'),
+                    color=alt.Color('YearStr:N', title='Year'),
+                    tooltip=[f'{group_col}:N', 'YearStr:N', alt.Tooltip('SalePrice:Q', format=',.2f')]
+                ).configure_view(stroke='transparent')
+
+                st.altair_chart(yoy_prod_chart, use_container_width=True)
+
+            st.divider()
+
+            # ---------------------------------------------------------------------
+            # 4. DATA MATRIX & EXPORT
+            # ---------------------------------------------------------------------
+            st.write("###### Revenue ($) Data Matrix")
+            group_yoy_matrix_subcat = st.checkbox("Group produces by Sub-Category", value=True, key="yoy_matrix_subcat_toggle")
+
+            yoy_matrix_df = yoy_filtered.copy()
+            yoy_matrix_df['EffectiveSubCategory'] = yoy_matrix_df.apply(resolve_effective_subcategory, axis=1)
+
+            if group_yoy_matrix_subcat:
+                prod_label_map = yoy_matrix_df.groupby(['Category', 'EffectiveSubCategory'])['ProductName'].agg(
+                    lambda x: f"{x.nunique()} product(s)" if x.nunique() > 1 else x.iloc[0]
+                )
+                yoy_matrix_df['ProductNameLabel'] = yoy_matrix_df.set_index(['Category', 'EffectiveSubCategory']).index.map(prod_label_map)
+                pivot_index = ['Category', 'EffectiveSubCategory', 'ProductNameLabel']
+            else:
+                pivot_index = ['Category', 'EffectiveSubCategory', 'ProductName']
+
+            index_names = ['Category', 'SubCategory', 'ProductName']
+
+            yoy_pivot = pd.pivot_table(
+                yoy_matrix_df,
+                values=target_col,
+                index=pivot_index,
+                columns='Year',
+                aggfunc='sum',
+                fill_value=0
+            )
+            yoy_pivot.index.names = index_names
+
+            if not yoy_pivot.empty:
+                col_sums = yoy_pivot.sum(numeric_only=True)
+                total_index = pd.MultiIndex.from_tuples([("TOTAL", "", "")], names=index_names)
+                total_df = pd.DataFrame([col_sums], index=total_index)
+                yoy_pivot_with_total = pd.concat([yoy_pivot, total_df])
+            else:
+                yoy_pivot_with_total = yoy_pivot
+
+            st.dataframe(yoy_pivot_with_total, use_container_width=True)
+
+            # Export Data Matrix Button
+            csv_matrix = yoy_pivot_with_total.to_csv().encode('utf-8')
+            st.download_button(
+                label="📥 Download Data Matrix as CSV",
+                data=csv_matrix,
+                file_name=f"YoY_Revenue_Data_Matrix_{datetime.datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="download_yoy_matrix_btn"
+            )
 
 
 # =============================================================================
@@ -1319,7 +1341,7 @@ if is_local and tab3:
         # SUB-TAB 3.2: PRODUCT MAPPINGS TABLE
         # -------------------------------------------------------------------------
         with subtab3_2:
-            st.write("Manage the single shared mapping table used across all CSV imports (Tab 1 & Tab 4).")
+            st.write("Manage the single shared mapping table used across all CSV imports (Tab 1 & Tab 5).")
 
             mappings_df = get_all_mappings_df()
 
@@ -1361,329 +1383,447 @@ if is_local and tab3:
 
 
 # =============================================================================
-# TAB 4: ORDER MANAGEMENT & MARKET IMPORTER (LOCAL ONLY)
+# TAB 4: CUSTOMER MANAGEMENT (LOCAL ONLY)
 # =============================================================================
-if is_local and tab4:
-    with tab4:
-        st.header("📦 Order Management")
+if is_local and tab_cust:
+    with tab_cust:
+        st.header("👥 Customer Management")
+        st.write("View, create, edit, and merge customer records stored in the database.")
 
-        mode = st.radio(
-            "Select Action:",
-            ["📥 Import Market Order from CSV", "✏️ Search & Edit Existing Orders"],
-            horizontal=True,
-            key="tab4_action_mode"
-        )
+        with st.expander("➕ Add New Customer", expanded=False):
+            with st.form("add_customer_form"):
+                new_c_name = st.text_input("Customer Name (e.g. Restaurant Le Bistro)")
+                submit_new_cust = st.form_submit_button("💾 Save New Customer")
+                if submit_new_cust:
+                    if not new_c_name.strip():
+                        st.error("Please provide a valid Customer Name.")
+                    else:
+                        try:
+                            get_or_create_customer(new_c_name.strip())
+                            st.success(f"Customer '{new_c_name.strip()}' created successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error creating customer: {e}")
 
         st.divider()
 
-        # -------------------------------------------------------------------------
-        # MODE 1: IMPORT MARKET ORDER FROM CSV
-        # -------------------------------------------------------------------------
-        if mode == "📥 Import Market Order from CSV":
-            st.subheader("📥 Import Market Sales CSV")
-            st.write("Upload a market sales CSV to automatically prefill dates, map products, aggregate duplicates, and register a new order.")
+        with get_db_connection() as conn:
+            cust_df = pd.read_sql_query("SELECT CustomerID, Name FROM Customers ORDER BY Name", conn)
 
-            try:
-                db_products_df = get_all_products()
-                product_display_list = ["++ Create New Product ++"] + (
-                    db_products_df['Display'].tolist() if not db_products_df.empty else []
-                )
-                display_to_id = {row['Display']: row['ProductID'] for _, row in db_products_df.iterrows()} if not db_products_df.empty else {}
-                id_to_display = {row['ProductID']: row['Display'] for _, row in db_products_df.iterrows()} if not db_products_df.empty else {}
-            except Exception:
-                db_products_df = pd.DataFrame()
-                product_display_list = ["++ Create New Product ++"]
-                display_to_id, id_to_display = {}, {}
-
-            if len(product_display_list) <= 1:
-                st.info("💡 Your database has no existing products. Unmapped items will automatically default to creating a new product.")
-
-            uploaded_file = st.file_uploader("Upload market POS CSV", type=["csv"], key="market_csv_upload")
-
-            extracted_date = datetime.date.today()
-            if uploaded_file:
-                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', uploaded_file.name)
-                if date_match:
-                    try:
-                        extracted_date = datetime.datetime.strptime(date_match.group(1), "%Y-%m-%d").date()
-                    except ValueError:
-                        pass
-
-            with st.container():
-                c1, c2, c3, c4 = st.columns(4)
-                default_order_id = f"MARKET-{extracted_date.strftime('%Y%m%d')}"
-                new_order_id = c1.text_input("Order ID", value=default_order_id, key="market_order_id")
-                new_customer = c2.text_input("Customer Name", value="Market", key="market_customer_name")
-                new_date_placed = c3.date_input("Date Placed", value=extracted_date, key="market_date_placed")
-                new_date_fulfilled = c4.date_input("Date Fulfilled", value=extracted_date, key="market_date_fulfilled")
-
-            if uploaded_file and product_display_list:
-                if "market_csv_name" not in st.session_state or st.session_state["market_csv_name"] != uploaded_file.name:
-                    try:
-                        external_df = read_csv_robust(uploaded_file)
-                    except Exception as e:
-                        st.error(f"Error reading CSV: {e}")
-                        external_df = pd.DataFrame()
-
-                    parsed_df = parse_csv_to_scratch(external_df, db_products_df)
-
-                    parsed_df['Selected DB Product'] = parsed_df['ProductID'].apply(
-                        lambda x: id_to_display.get(x, "++ Create New Product ++")
-                    )
-
-                    st.session_state["market_draft_df"] = parsed_df[
-                        ['ImportName', 'Selected DB Product', 'BaseQuantitySold', 'SalePrice']
-                    ]
-                    st.session_state["market_csv_name"] = uploaded_file.name
-
-                st.subheader("Review & Map Products")
-                st.info("Multiple rows mapped to the same product will be automatically merged into a single sales line upon saving.")
-
-                edited_market_df = st.data_editor(
-                    st.session_state["market_draft_df"],
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="market_items_editor",
-                    column_config={
-                        "ImportName": st.column_config.TextColumn("CSV Original Name", disabled=True),
-                        "Selected DB Product": st.column_config.SelectboxColumn("Mapped DB Product", options=product_display_list, required=True),
-                        "BaseQuantitySold": st.column_config.NumberColumn("Quantity Sold", step=0.1),
-                        "SalePrice": st.column_config.NumberColumn("Sale Price ($)", step=1.0)
-                    }
-                )
-
-                st.divider()
-
-                if st.button("🚀 Aggregate & Save Market Order", type="primary"):
-                    if not new_order_id.strip():
-                        st.error("Please enter a valid Order ID.")
-                    elif edited_market_df["Selected DB Product"].isna().any() or edited_market_df["Selected DB Product"].eq("").any():
-                        st.error("Please ensure all items are mapped to a Database Product.")
-                    else:
-                        needs_creation = edited_market_df[
-                            edited_market_df["Selected DB Product"] == "++ Create New Product ++"
-                        ]
-
-                        if not needs_creation.empty:
-                            import_names_to_create = needs_creation["ImportName"].unique().tolist()
-                            define_new_products_dialog(import_names_to_create)
-                        else:
-                            with st.spinner("Saving mappings and aggregating order items..."):
-                                edited_market_df['FinalProductID'] = edited_market_df['Selected DB Product'].map(display_to_id)
-
-                                for _, row in edited_market_df.iterrows():
-                                    csv_name = row['ImportName']
-                                    p_id = row['FinalProductID']
-                                    if pd.notna(csv_name) and str(csv_name).strip() != "" and pd.notna(p_id):
-                                        save_product_mapping(str(csv_name).strip(), str(p_id))
-
-                                aggregated_df = edited_market_df.groupby('FinalProductID').agg({
-                                    'BaseQuantitySold': 'sum',
-                                    'SalePrice': 'sum'
-                                }).reset_index()
-
-                                try:
-                                    c_id = get_or_create_customer(new_customer)
-                                    get_or_create_order(new_order_id, c_id, str(new_date_placed), str(new_date_fulfilled))
-
-                                    for _, row in aggregated_df.iterrows():
-                                        create_sale(new_order_id, row['FinalProductID'], float(row['BaseQuantitySold']), float(row['SalePrice']))
-
-                                    st.success(f"🎉 Successfully created order `{new_order_id}` with {len(aggregated_df)} combined line items!")
-
-                                    del st.session_state["market_draft_df"]
-                                    del st.session_state["market_csv_name"]
-
-                                    if st.button("Return to Order Manager"):
-                                        st.rerun()
-
-                                except Exception as e:
-                                    st.error(f"Database error while saving order: {e}")
-
-        # -------------------------------------------------------------------------
-        # MODE 2: SEARCH & EDIT EXISTING ORDERS
-        # -------------------------------------------------------------------------
+        if cust_df.empty:
+            st.info("No customers found in the database yet.")
         else:
-            st.subheader("🔍 Search & Edit Existing Registered Orders")
+            cust_df.insert(0, "Select for Merge", False)
 
-            orders_query = '''
-                SELECT 
-                    o.OrderID, 
-                    c.Name AS CustomerName, 
-                    o.DatePlaced, 
-                    o.DateFullfilled,
-                    COALESCE(SUM(s.SalePrice), 0.0) AS TotalOrderPrice,
-                    GROUP_CONCAT(p.Name, '||') AS ContainedProductNames
-                FROM Orders o
-                JOIN Customers c ON o.CustomerID = c.CustomerID
-                LEFT JOIN Sales s ON o.OrderID = s.OrderID
-                LEFT JOIN Products p ON s.ProductID = p.ProductID
-                GROUP BY o.OrderID, c.Name, o.DatePlaced, o.DateFullfilled
-                ORDER BY o.DateFullfilled DESC
-            '''
-            with get_db_connection() as conn:
-                registered_orders_df = pd.read_sql_query(orders_query, conn)
+            st.write("Edit customer names directly in the table below and click **Save Customer Changes**, OR select customers to **Merge**.")
 
-            if registered_orders_df.empty:
-                st.info("No registered orders found in the database yet.")
-            else:
-                registered_orders_df['DateFullfilled_Obj'] = pd.to_datetime(
-                    registered_orders_df['DateFullfilled'], errors='coerce'
-                ).dt.date
+            c_merge_btn, _ = st.columns([1, 2])
 
-                st.markdown("##### 🔎 Filter Orders")
-                f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+            edited_cust_df = st.data_editor(
+                cust_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="customer_editor",
+                column_config={
+                    "Select for Merge": st.column_config.CheckboxColumn("Merge", default=False),
+                    "CustomerID": st.column_config.NumberColumn("Customer ID", disabled=True),
+                    "Name": st.column_config.TextColumn("Customer Name", required=True)
+                }
+            )
 
-                filter_customers = f_col1.multiselect("Filter by Customer", sorted(registered_orders_df['CustomerName'].dropna().unique()), key="edit_search_cust")
-                filter_dates = f_col2.multiselect("Filter by Date Fulfilled", sorted(registered_orders_df['DateFullfilled_Obj'].dropna().unique(), reverse=True, key=str), key="edit_search_date")
+            selected_cust_for_merge = edited_cust_df[edited_cust_df["Select for Merge"] == True]
 
-                db_prods = get_all_products()
-                all_prod_names = sorted(db_prods['Name'].tolist()) if not db_prods.empty else []
-                filter_products = f_col3.multiselect("Filter by Product Contained", all_prod_names, key="edit_search_prod")
+            with c_merge_btn:
+                if st.button("🔗 Merge Selected Customers", type="secondary", key="btn_merge_cust"):
+                    if len(selected_cust_for_merge) >= 2:
+                        merge_customers_dialog(selected_cust_for_merge)
+                    else:
+                        st.error("Please check the 'Merge' box on at least 2 customers before clicking.")
 
-                max_possible_price = float(registered_orders_df['TotalOrderPrice'].max()) if not registered_orders_df.empty else 1000.0
-                price_range = f_col4.slider("Filter by Order Total ($)", min_value=0.0, max_value=max(max_possible_price, 100.0), value=(0.0, max(max_possible_price, 100.0)), step=5.0, key="edit_search_price_slider")
+            st.write("---")
+            if st.button("💾 Save Customer Info Changes", type="primary", key="btn_save_cust"):
+                try:
+                    with get_db_connection() as conn:
+                        cursor = conn.cursor()
+                        for _, row in edited_cust_df.iterrows():
+                            if pd.notna(row['CustomerID']) and str(row['Name']).strip():
+                                cursor.execute('''
+                                    UPDATE Customers 
+                                    SET Name = ? 
+                                    WHERE CustomerID = ?
+                                ''', (str(row['Name']).strip(), int(row['CustomerID'])))
+                        conn.commit()
+                    st.success("Customer names updated successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error updating customers: {e}")
 
-                filtered_orders_df = registered_orders_df.copy()
+with tab4:
+    st.header("📦 Order Management")
 
-                if filter_customers:
-                    filtered_orders_df = filtered_orders_df[filtered_orders_df['CustomerName'].isin(filter_customers)]
-                if filter_dates:
-                    filtered_orders_df = filtered_orders_df[filtered_orders_df['DateFullfilled_Obj'].isin(filter_dates)]
-                if filter_products:
-                    def contains_any_prod(prod_concat_str):
-                        if not prod_concat_str or pd.isna(prod_concat_str):
-                            return False
-                        prods_in_order = set(prod_concat_str.split('||'))
-                        return any(p in prods_in_order for p in filter_products)
+    mode = st.radio(
+        "Select Action:",
+        ["📥 Import Market Order from CSV", "✏️ Search & Edit Existing Orders"],
+        horizontal=True,
+        key="tab4_action_mode"
+    )
 
-                    filtered_orders_df = filtered_orders_df[filtered_orders_df['ContainedProductNames'].apply(contains_any_prod)]
+    st.divider()
 
-                filtered_orders_df = filtered_orders_df[
-                    (filtered_orders_df['TotalOrderPrice'] >= price_range[0]) &
-                    (filtered_orders_df['TotalOrderPrice'] <= price_range[1])
-                ]
+    # -------------------------------------------------------------------------
+    # MODE 1: IMPORT MARKET ORDER FROM CSV
+    # -------------------------------------------------------------------------
+    if mode == "📥 Import Market Order from CSV":
+        st.subheader("📥 Import Market Sales CSV")
+        st.write(
+            "Upload a market sales CSV to automatically prefill dates, map products, aggregate duplicates, and register a new order.")
 
-                st.caption(f"Found **{len(filtered_orders_df)}** matching order(s).")
-                st.divider()
+        try:
+            db_products_df = get_all_products()
+            product_display_list = ["++ Create New Product ++"] + (
+                db_products_df['Display'].tolist() if not db_products_df.empty else [])
+            display_to_id = {row['Display']: row['ProductID'] for _, row in
+                             db_products_df.iterrows()} if not db_products_df.empty else {}
+            id_to_display = {row['ProductID']: row['Display'] for _, row in
+                             db_products_df.iterrows()} if not db_products_df.empty else {}
+        except Exception:
+            db_products_df = pd.DataFrame()
+            product_display_list = ["++ Create New Product ++"]
+            display_to_id, id_to_display = {}, {}
 
-                if filtered_orders_df.empty:
-                    st.warning("No orders match the selected search filters.")
+        if len(product_display_list) <= 1:
+            st.info(
+                "💡 Your database has no existing products. Unmapped items will automatically default to creating a new product.")
+
+        uploaded_file = st.file_uploader("Upload market POS CSV", type=["csv"],
+                                         key="market_csv_upload")
+
+        extracted_date = datetime.date.today()
+        if uploaded_file:
+            date_matches = re.findall(r'(\d{4}-\d{2}-\d{2})', uploaded_file.name)
+            if date_matches:
+                try:
+                    extracted_date = datetime.datetime.strptime(date_matches[0], "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+
+            if st.session_state.get("market_csv_name") != uploaded_file.name:
+                st.session_state["market_date_placed"] = extracted_date
+                st.session_state["market_date_fulfilled"] = extracted_date
+                st.session_state["market_order_id"] = f"MARKET-{extracted_date.strftime('%Y%m%d')}"
+
+        with st.container():
+            c1, c2, c3, c4 = st.columns(4)
+            default_order_id = f"MARKET-{extracted_date.strftime('%Y%m%d')}"
+            new_order_id = c1.text_input("Order ID", value=default_order_id, key="market_order_id")
+            new_customer = c2.text_input("Customer Name", value="Market",
+                                         key="market_customer_name")
+            new_date_placed = c3.date_input("Date Placed", value=extracted_date,
+                                            key="market_date_placed")
+            new_date_fulfilled = c4.date_input("Date Fulfilled", value=extracted_date,
+                                               key="market_date_fulfilled")
+
+        if uploaded_file and product_display_list:
+            if "market_csv_name" not in st.session_state or st.session_state[
+                "market_csv_name"] != uploaded_file.name:
+                try:
+                    uploaded_file.seek(0)
+                    external_df = pd.read_csv(uploaded_file)
+                except Exception:
+                    uploaded_file.seek(0)
+                    try:
+                        external_df = pd.read_csv(uploaded_file, encoding='utf-16', sep='\t')
+                    except Exception:
+                        uploaded_file.seek(0)
+                        external_df = pd.read_csv(uploaded_file, encoding='windows-1252', sep=';')
+
+                parsed_df = parse_csv_to_scratch(external_df, db_products_df)
+
+                parsed_df['Selected DB Product'] = parsed_df['ProductID'].apply(
+                    lambda x: id_to_display.get(x, "++ Create New Product ++"))
+
+                st.session_state["market_draft_df"] = parsed_df[
+                    ['ImportName', 'Selected DB Product', 'BaseQuantitySold', 'SalePrice']]
+                st.session_state["market_csv_name"] = uploaded_file.name
+
+            st.subheader("Review & Map Products")
+            st.info(
+                "Multiple rows mapped to the same product will be automatically merged into a single sales line upon saving.")
+
+            edited_market_df = st.data_editor(
+                st.session_state["market_draft_df"],
+                num_rows="dynamic",
+                use_container_width=True,
+                key="market_items_editor",
+                column_config={
+                    "ImportName": st.column_config.TextColumn("CSV Original Name", disabled=True),
+                    "Selected DB Product": st.column_config.SelectboxColumn("Mapped DB Product",
+                                                                            options=product_display_list,
+                                                                            required=True),
+                    "BaseQuantitySold": st.column_config.NumberColumn("Quantity Sold", step=0.1),
+                    "SalePrice": st.column_config.NumberColumn("Sale Price ($)", step=1.0)
+                }
+            )
+
+            st.divider()
+
+            if st.button("🚀 Aggregate & Save Market Order", type="primary"):
+                if not new_order_id.strip():
+                    st.error("Please enter a valid Order ID.")
+                elif edited_market_df["Selected DB Product"].isna().any() or edited_market_df[
+                    "Selected DB Product"].eq(
+                        "").any():
+                    st.error("Please ensure all items are mapped to a Database Product.")
                 else:
-                    def format_reg_order_display(o_id):
-                        m_row = filtered_orders_df[filtered_orders_df['OrderID'] == o_id].iloc[0]
-                        return f"Order: {o_id} | Customer: {m_row['CustomerName']} | Total: ${m_row['TotalOrderPrice']:.2f} | Fulfilled: {m_row['DateFullfilled']}"
+                    needs_creation = edited_market_df[
+                        edited_market_df["Selected DB Product"] == "++ Create New Product ++"]
 
-                    selected_edit_order_id = st.selectbox(
-                        "Select Order to Edit",
-                        filtered_orders_df['OrderID'].tolist(),
-                        format_func=format_reg_order_display,
-                        key="edit_selected_order_selectbox"
-                    )
+                    if not needs_creation.empty:
+                        import_names_to_create = needs_creation["ImportName"].unique().tolist()
+                        define_new_products_dialog(import_names_to_create)
+                    else:
+                        with st.spinner("Saving mappings and aggregating order items..."):
+                            edited_market_df['FinalProductID'] = edited_market_df[
+                                'Selected DB Product'].map(
+                                display_to_id)
 
-                    if selected_edit_order_id:
-                        with get_db_connection() as conn:
-                            order_header = pd.read_sql_query('SELECT * FROM Orders WHERE OrderID = ?', conn, params=(selected_edit_order_id,)).iloc[0]
-                            sales_items_df = pd.read_sql_query('''
-                                SELECT 
-                                    s.SaleID, 
-                                    s.ProductID, 
-                                    p.Name AS ProductName, 
-                                    s.BaseQuantitySold, 
-                                    s.SalePrice
-                                FROM Sales s
-                                LEFT JOIN Products p ON s.ProductID = p.ProductID
-                                WHERE s.OrderID = ?
-                            ''', conn, params=(selected_edit_order_id,))
+                            for _, row in edited_market_df.iterrows():
+                                csv_name = row['ImportName']
+                                p_id = row['FinalProductID']
+                                if pd.notna(csv_name) and str(csv_name).strip() != "" and pd.notna(
+                                        p_id):
+                                    save_product_mapping(str(csv_name).strip(), str(p_id))
 
-                        all_cust_df = get_all_customers()
-                        cust_names = all_cust_df['Name'].tolist()
-                        current_cust_row = all_cust_df[all_cust_df['CustomerID'] == order_header['CustomerID']]
-                        current_cust_name = current_cust_row.iloc[0]['Name'] if not current_cust_row.empty else (cust_names[0] if cust_names else "Market")
+                            aggregated_df = edited_market_df.groupby('FinalProductID').agg({
+                                'BaseQuantitySold': 'sum',
+                                'SalePrice': 'sum'
+                            }).reset_index()
 
-                        st.markdown(f"### ✏️ Editing Order `{selected_edit_order_id}`")
+                            try:
+                                c_id = get_or_create_customer(new_customer)
+                                get_or_create_order(new_order_id, c_id, str(new_date_placed),
+                                                    str(new_date_fulfilled))
 
-                        with st.form("edit_order_header_form"):
-                            ec1, ec2, ec3 = st.columns(3)
-                            if current_cust_name not in cust_names:
-                                cust_names.append(current_cust_name)
+                                for _, row in aggregated_df.iterrows():
+                                    create_sale(new_order_id, row['FinalProductID'],
+                                                float(row['BaseQuantitySold']),
+                                                float(row['SalePrice']))
 
-                            updated_cust_name = ec1.selectbox("Customer Name", cust_names, index=cust_names.index(current_cust_name), key="edit_hdr_cust")
-                            updated_date_placed = ec2.date_input("Date Placed", value=safe_parse_date(order_header['DatePlaced']), key="edit_hdr_dp")
-                            updated_date_fulfilled = ec3.date_input("Date Fulfilled", value=safe_parse_date(order_header['DateFullfilled']), key="edit_hdr_df")
+                                st.success(
+                                    f"🎉 Successfully created order `{new_order_id}` with {len(aggregated_df)} combined line items!")
 
-                            submit_header_btn = st.form_submit_button("💾 Save Header Details")
+                                del st.session_state["market_draft_df"]
+                                del st.session_state["market_csv_name"]
 
-                            if submit_header_btn:
-                                try:
-                                    c_id = get_or_create_customer(updated_cust_name)
-                                    get_or_create_order(selected_edit_order_id, c_id, str(updated_date_placed), str(updated_date_fulfilled))
-                                    st.success("Order header details updated successfully!")
+                                if st.button("Return to Order Manager"):
                                     st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error updating order header: {e}")
 
-                        st.markdown("#### 🛒 Line Items in this Order")
-                        db_prods = get_all_products()
-                        all_db_pids = db_prods['ProductID'].tolist() if not db_prods.empty else []
+                            except Exception as e:
+                                st.error(f"Database error while saving order: {e}")
 
+    # -------------------------------------------------------------------------
+    # MODE 2: SEARCH & EDIT EXISTING ORDERS
+    # -------------------------------------------------------------------------
+    else:
+        st.subheader("✏️ Search & Edit Existing Registered Orders")
+
+        conn = sqlite3.connect(DB_FILENAME)
+        registered_orders_df = pd.read_sql_query('''
+                        SELECT o.OrderID, c.Name AS CustomerName, o.DatePlaced, o.DateFullfilled 
+                        FROM Orders o
+                        JOIN Customers c ON o.CustomerID = c.CustomerID
+                        ORDER BY o.DateFullfilled DESC
+                    ''', conn)
+
+        registered_orders_df['DateFullfilled_Obj'] = pd.to_datetime(
+            registered_orders_df['DateFullfilled'],
+            errors='coerce',
+            format='mixed'
+        ).dt.date
+        registered_orders_df['DateFullfilled_Obj'] = registered_orders_df[
+            'DateFullfilled_Obj'].fillna(
+            registered_orders_df['DateFullfilled']
+        )
+
+        order_products_df = pd.read_sql_query('''
+                        SELECT s.OrderID, p.Name AS ProductName
+                        FROM Sales s
+                        JOIN Products p ON s.ProductID = p.ProductID
+                    ''', conn)
+        conn.close()
+
+        if registered_orders_df.empty:
+            st.info("No orders registered in the database yet.")
+        else:
+            st.markdown("### 🔍 Search & Filter Orders")
+
+            f_col1, f_col2, f_col3 = st.columns(3)
+
+            all_order_dates = sorted(
+                registered_orders_df['DateFullfilled_Obj'].dropna().unique().tolist(),
+                reverse=True, key=str)
+            search_dates = f_col1.multiselect("Filter by Date Fulfilled", all_order_dates,
+                                              default=[],
+                                              key="search_edit_date")
+
+            all_sold_products = sorted(order_products_df['ProductName'].dropna().unique().tolist())
+            search_products = f_col2.multiselect("Filter by Product Contained", all_sold_products,
+                                                 default=[],
+                                                 key="search_edit_prod")
+
+            all_order_customers = sorted(
+                registered_orders_df['CustomerName'].dropna().unique().tolist())
+            search_customers = f_col3.multiselect("Filter by Customer", all_order_customers,
+                                                  default=[],
+                                                  key="search_edit_cust")
+
+            valid_order_ids = registered_orders_df['OrderID'].tolist()
+
+            if search_dates:
+                registered_orders_df = registered_orders_df[
+                    registered_orders_df['DateFullfilled_Obj'].isin(search_dates)]
+                valid_order_ids = registered_orders_df['OrderID'].tolist()
+
+            if search_customers:
+                registered_orders_df = registered_orders_df[
+                    registered_orders_df['CustomerName'].isin(search_customers)]
+                valid_order_ids = registered_orders_df['OrderID'].tolist()
+
+            if search_products:
+                matched_orders = \
+                order_products_df[order_products_df['ProductName'].isin(search_products)][
+                    'OrderID'].unique()
+                valid_order_ids = [oid for oid in valid_order_ids if oid in matched_orders]
+                registered_orders_df = registered_orders_df[
+                    registered_orders_df['OrderID'].isin(valid_order_ids)]
+
+            st.divider()
+
+            if not valid_order_ids:
+                st.warning("No orders match the selected filters.")
+            else:
+                def format_reg_order(o_id):
+                    row = registered_orders_df[registered_orders_df['OrderID'] == o_id].iloc[0]
+                    return f"Order {o_id} | {row['CustomerName']} | Fulfilled: {row['DateFullfilled']}"
+
+
+                selected_reg_order = st.selectbox("Select Registered Order to Edit",
+                                                  valid_order_ids,
+                                                  format_func=format_reg_order)
+
+                if selected_reg_order:
+                    conn = sqlite3.connect(DB_FILENAME)
+                    order_header = pd.read_sql_query('SELECT * FROM Orders WHERE OrderID = ?', conn,
+                                                     params=(selected_reg_order,)).iloc[0]
+                    sales_items_df = pd.read_sql_query('''
+                                    SELECT s.SaleID, s.ProductID, p.Name AS ProductName, s.BaseQuantitySold, s.SalePrice
+                                    FROM Sales s
+                                    JOIN Products p ON s.ProductID = p.ProductID
+                                    WHERE s.OrderID = ?
+                                ''', conn, params=(selected_reg_order,))
+                    conn.close()
+
+                    all_cust_df = get_all_customers()
+                    cust_names = all_cust_df['Name'].tolist()
+                    current_cust_row = all_cust_df[
+                        all_cust_df['CustomerID'] == order_header['CustomerID']]
+                    current_cust_name = current_cust_row.iloc[0][
+                        'Name'] if not current_cust_row.empty else (
+                        cust_names[0] if cust_names else "Market")
+
+                    st.subheader(f"Editing Order: {selected_reg_order}")
+
+                    with st.form("edit_order_header_form"):
+                        ec1, ec2, ec3 = st.columns(3)
+                        new_cust_name = ec1.selectbox("Customer",
+                                                      cust_names if cust_names else ["Market"],
+                                                      index=cust_names.index(
+                                                          current_cust_name) if cust_names and current_cust_name in cust_names else 0)
+
+                        val_dp = safe_parse_date(order_header['DatePlaced'])
+                        val_df = safe_parse_date(order_header['DateFullfilled'])
+                        new_date_placed = ec2.date_input("Date Placed", value=val_dp)
+                        new_date_fulfilled = ec3.date_input("Date Fulfilled", value=val_df)
+
+                        update_header_btn = st.form_submit_button("💾 Update Order Details")
+                        if update_header_btn:
+                            try:
+                                c_id = get_or_create_customer(new_cust_name)
+                                get_or_create_order(selected_reg_order, c_id, str(new_date_placed),
+                                                    str(new_date_fulfilled))
+                                st.success("Order header details updated successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error updating order: {e}")
+
+                    st.markdown("#### Sales Line Items in this Order")
+                    if sales_items_df.empty:
+                        st.warning("No sales items found for this order.")
+                    else:
                         edited_sales_df = st.data_editor(
                             sales_items_df,
                             num_rows="dynamic",
                             use_container_width=True,
-                            key="edit_sales_editor",
+                            key="sales_editor",
                             column_config={
                                 "SaleID": st.column_config.NumberColumn("Sale ID", disabled=True),
-                                "ProductID": st.column_config.SelectboxColumn("Product ID", options=all_db_pids, required=True),
-                                "ProductName": st.column_config.TextColumn("Product Name (DB Reference)", disabled=True),
-                                "BaseQuantitySold": st.column_config.NumberColumn("Quantity Sold", step=0.1, required=True),
-                                "SalePrice": st.column_config.NumberColumn("Sale Price ($)", step=1.0, required=True)
+                                "ProductID": st.column_config.TextColumn("Product ID"),
+                                "ProductName": st.column_config.TextColumn("Product Name"),
+                                "BaseQuantitySold": st.column_config.NumberColumn("Base Qty Sold",
+                                                                                  step=0.1),
+                                "SalePrice": st.column_config.NumberColumn("Sale Price ($)",
+                                                                           step=1.0)
                             }
                         )
 
-                        c_save, c_del = st.columns([3, 1])
+                        if st.button("💾 Save Sales Line Items Changes", type="primary"):
+                            try:
+                                conn = sqlite3.connect(DB_FILENAME)
+                                cursor = conn.cursor()
 
-                        with c_save:
-                            if st.button("💾 Save Sales Line Item Changes", type="primary", key="btn_save_line_items"):
-                                try:
-                                    with get_db_connection() as conn:
-                                        cursor = conn.cursor()
-                                        existing_sale_ids = set(sales_items_df['SaleID'].dropna().tolist())
-                                        updated_sale_ids = set(edited_sales_df['SaleID'].dropna().tolist())
+                                existing_sale_ids = set(sales_items_df['SaleID'].tolist())
+                                updated_sale_ids = set(edited_sales_df['SaleID'].dropna().tolist())
 
-                                        deleted_ids = existing_sale_ids - updated_sale_ids
-                                        for d_id in deleted_ids:
-                                            cursor.execute("DELETE FROM Sales WHERE SaleID = ?", (d_id,))
+                                deleted_ids = existing_sale_ids - updated_sale_ids
+                                for d_id in deleted_ids:
+                                    cursor.execute("DELETE FROM Sales WHERE SaleID = ?", (d_id,))
 
-                                        for _, row in edited_sales_df.iterrows():
-                                            if pd.notna(row['SaleID']) and row['SaleID'] in existing_sale_ids:
-                                                cursor.execute('''
-                                                    UPDATE Sales 
-                                                    SET ProductID = ?, BaseQuantitySold = ?, SalePrice = ?
-                                                    WHERE SaleID = ?
-                                                ''', (row['ProductID'], float(row['BaseQuantitySold']), float(row['SalePrice']), row['SaleID']))
-                                            else:
-                                                cursor.execute('''
-                                                    INSERT INTO Sales (OrderID, ProductID, BaseQuantitySold, SalePrice)
-                                                    VALUES (?, ?, ?, ?)
-                                                ''', (selected_edit_order_id, row['ProductID'], float(row['BaseQuantitySold']), float(row['SalePrice'])))
-                                        conn.commit()
+                                for _, row in edited_sales_df.iterrows():
+                                    if pd.notna(row['SaleID']) and row[
+                                        'SaleID'] in existing_sale_ids:
+                                        cursor.execute('''
+                                                        UPDATE Sales 
+                                                        SET ProductID = ?, BaseQuantitySold = ?, SalePrice = ?
+                                                        WHERE SaleID = ?
+                                                    ''', (row['ProductID'], row['BaseQuantitySold'],
+                                                          row['SalePrice'], row['SaleID']))
+                                    else:
+                                        cursor.execute('''
+                                                        INSERT INTO Sales (OrderID, ProductID, BaseQuantitySold, SalePrice)
+                                                        VALUES (?, ?, ?, ?)
+                                                    ''', (selected_reg_order, row['ProductID'],
+                                                          row['BaseQuantitySold'],
+                                                          row['SalePrice']))
 
-                                    st.success("Sales items updated successfully!")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error updating sales items: {e}")
+                                conn.commit()
+                                conn.close()
+                                st.success("Sales items updated successfully!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error saving sales items: {e}")
 
-                        with c_del:
-                            if st.button("🗑️ Delete Entire Order", type="secondary", key="btn_delete_order"):
-                                try:
-                                    with get_db_connection() as conn:
-                                        cursor = conn.cursor()
-                                        cursor.execute("DELETE FROM Sales WHERE OrderID = ?", (selected_edit_order_id,))
-                                        cursor.execute("DELETE FROM Orders WHERE OrderID = ?", (selected_edit_order_id,))
-                                        conn.commit()
-
-                                    st.success(f"Order `{selected_edit_order_id}` deleted successfully!")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error deleting order: {e}")
+                    st.divider()
+                    if st.button("🗑️ Delete Entire Order", type="secondary"):
+                        try:
+                            conn = sqlite3.connect(DB_FILENAME)
+                            cursor = conn.cursor()
+                            cursor.execute("DELETE FROM Sales WHERE OrderID = ?",
+                                           (selected_reg_order,))
+                            cursor.execute("DELETE FROM Orders WHERE OrderID = ?",
+                                           (selected_reg_order,))
+                            conn.commit()
+                            conn.close()
+                            st.success(f"Order {selected_reg_order} deleted successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error deleting order: {e}")
