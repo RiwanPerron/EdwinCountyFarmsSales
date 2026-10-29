@@ -1556,373 +1556,373 @@ if is_local and tab_cust:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error updating customers: {e}")
+if is_local and tab4:
+    with tab4:
+        st.header("📦 Order Management")
 
-with tab4:
-    st.header("📦 Order Management")
-
-    mode = st.radio(
-        "Select Action:",
-        ["📥 Import Market Order from CSV", "✏️ Search & Edit Existing Orders"],
-        horizontal=True,
-        key="tab4_action_mode"
-    )
-
-    st.divider()
-
-    # -------------------------------------------------------------------------
-    # MODE 1: IMPORT MARKET ORDER FROM CSV
-    # -------------------------------------------------------------------------
-    if mode == "📥 Import Market Order from CSV":
-        st.subheader("📥 Import Market Sales CSV")
-        st.write(
-            "Upload a market sales CSV to automatically prefill dates, map products, aggregate duplicates, and register a new order.")
-
-        try:
-            db_products_df = get_all_products()
-            product_display_list = ["++ Create New Product ++"] + (
-                db_products_df['Display'].tolist() if not db_products_df.empty else [])
-            display_to_id = {row['Display']: row['ProductID'] for _, row in
-                             db_products_df.iterrows()} if not db_products_df.empty else {}
-            id_to_display = {row['ProductID']: row['Display'] for _, row in
-                             db_products_df.iterrows()} if not db_products_df.empty else {}
-        except Exception:
-            db_products_df = pd.DataFrame()
-            product_display_list = ["++ Create New Product ++"]
-            display_to_id, id_to_display = {}, {}
-
-        if len(product_display_list) <= 1:
-            st.info(
-                "💡 Your database has no existing products. Unmapped items will automatically default to creating a new product.")
-
-        uploaded_file = st.file_uploader("Upload market POS CSV", type=["csv"],
-                                         key="market_csv_upload")
-
-        extracted_date = datetime.date.today()
-        if uploaded_file:
-            date_matches = re.findall(r'(\d{4}-\d{2}-\d{2})', uploaded_file.name)
-            if date_matches:
-                try:
-                    extracted_date = datetime.datetime.strptime(date_matches[0], "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-
-            if st.session_state.get("market_csv_name") != uploaded_file.name:
-                st.session_state["market_date_placed"] = extracted_date
-                st.session_state["market_date_fulfilled"] = extracted_date
-                st.session_state["market_order_id"] = f"MARKET-{extracted_date.strftime('%Y%m%d')}"
-
-        with st.container():
-            c1, c2, c3, c4 = st.columns(4)
-            default_order_id = f"MARKET-{extracted_date.strftime('%Y%m%d')}"
-            new_order_id = c1.text_input("Order ID", value=default_order_id, key="market_order_id")
-            new_customer = c2.text_input("Customer Name", value="Market",
-                                         key="market_customer_name")
-            new_date_placed = c3.date_input("Date Placed", value=extracted_date,
-                                            key="market_date_placed")
-            new_date_fulfilled = c4.date_input("Date Fulfilled", value=extracted_date,
-                                               key="market_date_fulfilled")
-
-        if uploaded_file and product_display_list:
-            if "market_csv_name" not in st.session_state or st.session_state[
-                "market_csv_name"] != uploaded_file.name:
-                try:
-                    uploaded_file.seek(0)
-                    external_df = pd.read_csv(uploaded_file)
-                except Exception:
-                    uploaded_file.seek(0)
-                    try:
-                        external_df = pd.read_csv(uploaded_file, encoding='utf-16', sep='\t')
-                    except Exception:
-                        uploaded_file.seek(0)
-                        external_df = pd.read_csv(uploaded_file, encoding='windows-1252', sep=';')
-
-                parsed_df = parse_csv_to_scratch(external_df, db_products_df)
-
-                parsed_df['Selected DB Product'] = parsed_df['ProductID'].apply(
-                    lambda x: id_to_display.get(x, "++ Create New Product ++"))
-
-                st.session_state["market_draft_df"] = parsed_df[
-                    ['ImportName', 'Selected DB Product', 'BaseQuantitySold', 'SalePrice']]
-                st.session_state["market_csv_name"] = uploaded_file.name
-
-            st.subheader("Review & Map Products")
-            st.info(
-                "Multiple rows mapped to the same product will be automatically merged into a single sales line upon saving.")
-
-            edited_market_df = st.data_editor(
-                st.session_state["market_draft_df"],
-                num_rows="dynamic",
-                use_container_width=True,
-                key="market_items_editor",
-                column_config={
-                    "ImportName": st.column_config.TextColumn("CSV Original Name", disabled=True),
-                    "Selected DB Product": st.column_config.SelectboxColumn("Mapped DB Product",
-                                                                            options=product_display_list,
-                                                                            required=True),
-                    "BaseQuantitySold": st.column_config.NumberColumn("Quantity Sold", step=0.1),
-                    "SalePrice": st.column_config.NumberColumn("Sale Price ($)", step=1.0)
-                }
-            )
-
-            st.divider()
-
-            if st.button("🚀 Aggregate & Save Market Order", type="primary"):
-                if not new_order_id.strip():
-                    st.error("Please enter a valid Order ID.")
-                elif edited_market_df["Selected DB Product"].isna().any() or edited_market_df[
-                    "Selected DB Product"].eq(
-                        "").any():
-                    st.error("Please ensure all items are mapped to a Database Product.")
-                else:
-                    needs_creation = edited_market_df[
-                        edited_market_df["Selected DB Product"] == "++ Create New Product ++"]
-
-                    if not needs_creation.empty:
-                        import_names_to_create = needs_creation["ImportName"].unique().tolist()
-                        define_new_products_dialog(import_names_to_create)
-                    else:
-                        with st.spinner("Saving mappings and aggregating order items..."):
-                            edited_market_df['FinalProductID'] = edited_market_df[
-                                'Selected DB Product'].map(
-                                display_to_id)
-
-                            for _, row in edited_market_df.iterrows():
-                                csv_name = row['ImportName']
-                                p_id = row['FinalProductID']
-                                if pd.notna(csv_name) and str(csv_name).strip() != "" and pd.notna(
-                                        p_id):
-                                    save_product_mapping(str(csv_name).strip(), str(p_id))
-
-                            aggregated_df = edited_market_df.groupby('FinalProductID').agg({
-                                'BaseQuantitySold': 'sum',
-                                'SalePrice': 'sum'
-                            }).reset_index()
-
-                            try:
-                                c_id = get_or_create_customer(new_customer)
-                                get_or_create_order(new_order_id, c_id, str(new_date_placed),
-                                                    str(new_date_fulfilled))
-
-                                for _, row in aggregated_df.iterrows():
-                                    create_sale(new_order_id, row['FinalProductID'],
-                                                float(row['BaseQuantitySold']),
-                                                float(row['SalePrice']))
-
-                                st.success(
-                                    f"🎉 Successfully created order `{new_order_id}` with {len(aggregated_df)} combined line items!")
-
-                                del st.session_state["market_draft_df"]
-                                del st.session_state["market_csv_name"]
-
-                                if st.button("Return to Order Manager"):
-                                    st.rerun()
-
-                            except Exception as e:
-                                st.error(f"Database error while saving order: {e}")
-
-    # -------------------------------------------------------------------------
-    # MODE 2: SEARCH & EDIT EXISTING ORDERS
-    # -------------------------------------------------------------------------
-    else:
-        st.subheader("✏️ Search & Edit Existing Registered Orders")
-
-        conn = sqlite3.connect(DB_FILENAME)
-        registered_orders_df = pd.read_sql_query('''
-                        SELECT o.OrderID, c.Name AS CustomerName, o.DatePlaced, o.DateFullfilled 
-                        FROM Orders o
-                        JOIN Customers c ON o.CustomerID = c.CustomerID
-                        ORDER BY o.DateFullfilled DESC
-                    ''', conn)
-
-        registered_orders_df['DateFullfilled_Obj'] = pd.to_datetime(
-            registered_orders_df['DateFullfilled'],
-            errors='coerce',
-            format='mixed'
-        ).dt.date
-        registered_orders_df['DateFullfilled_Obj'] = registered_orders_df[
-            'DateFullfilled_Obj'].fillna(
-            registered_orders_df['DateFullfilled']
+        mode = st.radio(
+            "Select Action:",
+            ["📥 Import Market Order from CSV", "✏️ Search & Edit Existing Orders"],
+            horizontal=True,
+            key="tab4_action_mode"
         )
 
-        order_products_df = pd.read_sql_query('''
-                        SELECT s.OrderID, p.Name AS ProductName
-                        FROM Sales s
-                        JOIN Products p ON s.ProductID = p.ProductID
-                    ''', conn)
-        conn.close()
+        st.divider()
 
-        if registered_orders_df.empty:
-            st.info("No orders registered in the database yet.")
-        else:
-            st.markdown("### 🔍 Search & Filter Orders")
+        # -------------------------------------------------------------------------
+        # MODE 1: IMPORT MARKET ORDER FROM CSV
+        # -------------------------------------------------------------------------
+        if mode == "📥 Import Market Order from CSV":
+            st.subheader("📥 Import Market Sales CSV")
+            st.write(
+                "Upload a market sales CSV to automatically prefill dates, map products, aggregate duplicates, and register a new order.")
 
-            f_col1, f_col2, f_col3 = st.columns(3)
+            try:
+                db_products_df = get_all_products()
+                product_display_list = ["++ Create New Product ++"] + (
+                    db_products_df['Display'].tolist() if not db_products_df.empty else [])
+                display_to_id = {row['Display']: row['ProductID'] for _, row in
+                                 db_products_df.iterrows()} if not db_products_df.empty else {}
+                id_to_display = {row['ProductID']: row['Display'] for _, row in
+                                 db_products_df.iterrows()} if not db_products_df.empty else {}
+            except Exception:
+                db_products_df = pd.DataFrame()
+                product_display_list = ["++ Create New Product ++"]
+                display_to_id, id_to_display = {}, {}
 
-            all_order_dates = sorted(
-                registered_orders_df['DateFullfilled_Obj'].dropna().unique().tolist(),
-                reverse=True, key=str)
-            search_dates = f_col1.multiselect("Filter by Date Fulfilled", all_order_dates,
-                                              default=[],
-                                              key="search_edit_date")
+            if len(product_display_list) <= 1:
+                st.info(
+                    "💡 Your database has no existing products. Unmapped items will automatically default to creating a new product.")
 
-            all_sold_products = sorted(order_products_df['ProductName'].dropna().unique().tolist())
-            search_products = f_col2.multiselect("Filter by Product Contained", all_sold_products,
-                                                 default=[],
-                                                 key="search_edit_prod")
+            uploaded_file = st.file_uploader("Upload market POS CSV", type=["csv"],
+                                             key="market_csv_upload")
 
-            all_order_customers = sorted(
-                registered_orders_df['CustomerName'].dropna().unique().tolist())
-            search_customers = f_col3.multiselect("Filter by Customer", all_order_customers,
-                                                  default=[],
-                                                  key="search_edit_cust")
+            extracted_date = datetime.date.today()
+            if uploaded_file:
+                date_matches = re.findall(r'(\d{4}-\d{2}-\d{2})', uploaded_file.name)
+                if date_matches:
+                    try:
+                        extracted_date = datetime.datetime.strptime(date_matches[0], "%Y-%m-%d").date()
+                    except ValueError:
+                        pass
 
-            valid_order_ids = registered_orders_df['OrderID'].tolist()
+                if st.session_state.get("market_csv_name") != uploaded_file.name:
+                    st.session_state["market_date_placed"] = extracted_date
+                    st.session_state["market_date_fulfilled"] = extracted_date
+                    st.session_state["market_order_id"] = f"MARKET-{extracted_date.strftime('%Y%m%d')}"
 
-            if search_dates:
-                registered_orders_df = registered_orders_df[
-                    registered_orders_df['DateFullfilled_Obj'].isin(search_dates)]
-                valid_order_ids = registered_orders_df['OrderID'].tolist()
+            with st.container():
+                c1, c2, c3, c4 = st.columns(4)
+                default_order_id = f"MARKET-{extracted_date.strftime('%Y%m%d')}"
+                new_order_id = c1.text_input("Order ID", value=default_order_id, key="market_order_id")
+                new_customer = c2.text_input("Customer Name", value="Market",
+                                             key="market_customer_name")
+                new_date_placed = c3.date_input("Date Placed", value=extracted_date,
+                                                key="market_date_placed")
+                new_date_fulfilled = c4.date_input("Date Fulfilled", value=extracted_date,
+                                                   key="market_date_fulfilled")
 
-            if search_customers:
-                registered_orders_df = registered_orders_df[
-                    registered_orders_df['CustomerName'].isin(search_customers)]
-                valid_order_ids = registered_orders_df['OrderID'].tolist()
+            if uploaded_file and product_display_list:
+                if "market_csv_name" not in st.session_state or st.session_state[
+                    "market_csv_name"] != uploaded_file.name:
+                    try:
+                        uploaded_file.seek(0)
+                        external_df = pd.read_csv(uploaded_file)
+                    except Exception:
+                        uploaded_file.seek(0)
+                        try:
+                            external_df = pd.read_csv(uploaded_file, encoding='utf-16', sep='\t')
+                        except Exception:
+                            uploaded_file.seek(0)
+                            external_df = pd.read_csv(uploaded_file, encoding='windows-1252', sep=';')
 
-            if search_products:
-                matched_orders = \
-                order_products_df[order_products_df['ProductName'].isin(search_products)][
-                    'OrderID'].unique()
-                valid_order_ids = [oid for oid in valid_order_ids if oid in matched_orders]
-                registered_orders_df = registered_orders_df[
-                    registered_orders_df['OrderID'].isin(valid_order_ids)]
+                    parsed_df = parse_csv_to_scratch(external_df, db_products_df)
 
-            st.divider()
+                    parsed_df['Selected DB Product'] = parsed_df['ProductID'].apply(
+                        lambda x: id_to_display.get(x, "++ Create New Product ++"))
 
-            if not valid_order_ids:
-                st.warning("No orders match the selected filters.")
-            else:
-                def format_reg_order(o_id):
-                    row = registered_orders_df[registered_orders_df['OrderID'] == o_id].iloc[0]
-                    return f"Order {o_id} | {row['CustomerName']} | Fulfilled: {row['DateFullfilled']}"
+                    st.session_state["market_draft_df"] = parsed_df[
+                        ['ImportName', 'Selected DB Product', 'BaseQuantitySold', 'SalePrice']]
+                    st.session_state["market_csv_name"] = uploaded_file.name
 
+                st.subheader("Review & Map Products")
+                st.info(
+                    "Multiple rows mapped to the same product will be automatically merged into a single sales line upon saving.")
 
-                selected_reg_order = st.selectbox("Select Registered Order to Edit",
-                                                  valid_order_ids,
-                                                  format_func=format_reg_order)
+                edited_market_df = st.data_editor(
+                    st.session_state["market_draft_df"],
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key="market_items_editor",
+                    column_config={
+                        "ImportName": st.column_config.TextColumn("CSV Original Name", disabled=True),
+                        "Selected DB Product": st.column_config.SelectboxColumn("Mapped DB Product",
+                                                                                options=product_display_list,
+                                                                                required=True),
+                        "BaseQuantitySold": st.column_config.NumberColumn("Quantity Sold", step=0.1),
+                        "SalePrice": st.column_config.NumberColumn("Sale Price ($)", step=1.0)
+                    }
+                )
 
-                if selected_reg_order:
-                    conn = sqlite3.connect(DB_FILENAME)
-                    order_header = pd.read_sql_query('SELECT * FROM Orders WHERE OrderID = ?', conn,
-                                                     params=(selected_reg_order,)).iloc[0]
-                    sales_items_df = pd.read_sql_query('''
-                                    SELECT s.SaleID, s.ProductID, p.Name AS ProductName, s.BaseQuantitySold, s.SalePrice
-                                    FROM Sales s
-                                    JOIN Products p ON s.ProductID = p.ProductID
-                                    WHERE s.OrderID = ?
-                                ''', conn, params=(selected_reg_order,))
-                    conn.close()
+                st.divider()
 
-                    all_cust_df = get_all_customers()
-                    cust_names = all_cust_df['Name'].tolist()
-                    current_cust_row = all_cust_df[
-                        all_cust_df['CustomerID'] == order_header['CustomerID']]
-                    current_cust_name = current_cust_row.iloc[0][
-                        'Name'] if not current_cust_row.empty else (
-                        cust_names[0] if cust_names else "Market")
-
-                    st.subheader(f"Editing Order: {selected_reg_order}")
-
-                    with st.form("edit_order_header_form"):
-                        ec1, ec2, ec3 = st.columns(3)
-                        new_cust_name = ec1.selectbox("Customer",
-                                                      cust_names if cust_names else ["Market"],
-                                                      index=cust_names.index(
-                                                          current_cust_name) if cust_names and current_cust_name in cust_names else 0)
-
-                        val_dp = safe_parse_date(order_header['DatePlaced'])
-                        val_df = safe_parse_date(order_header['DateFullfilled'])
-                        new_date_placed = ec2.date_input("Date Placed", value=val_dp)
-                        new_date_fulfilled = ec3.date_input("Date Fulfilled", value=val_df)
-
-                        update_header_btn = st.form_submit_button("💾 Update Order Details")
-                        if update_header_btn:
-                            try:
-                                c_id = get_or_create_customer(new_cust_name)
-                                get_or_create_order(selected_reg_order, c_id, str(new_date_placed),
-                                                    str(new_date_fulfilled))
-                                st.success("Order header details updated successfully!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error updating order: {e}")
-
-                    st.markdown("#### Sales Line Items in this Order")
-                    if sales_items_df.empty:
-                        st.warning("No sales items found for this order.")
+                if st.button("🚀 Aggregate & Save Market Order", type="primary"):
+                    if not new_order_id.strip():
+                        st.error("Please enter a valid Order ID.")
+                    elif edited_market_df["Selected DB Product"].isna().any() or edited_market_df[
+                        "Selected DB Product"].eq(
+                            "").any():
+                        st.error("Please ensure all items are mapped to a Database Product.")
                     else:
-                        edited_sales_df = st.data_editor(
-                            sales_items_df,
-                            num_rows="dynamic",
-                            use_container_width=True,
-                            key="sales_editor",
-                            column_config={
-                                "SaleID": st.column_config.NumberColumn("Sale ID", disabled=True),
-                                "ProductID": st.column_config.TextColumn("Product ID"),
-                                "ProductName": st.column_config.TextColumn("Product Name"),
-                                "BaseQuantitySold": st.column_config.NumberColumn("Base Qty Sold",
-                                                                                  step=0.1),
-                                "SalePrice": st.column_config.NumberColumn("Sale Price ($)",
-                                                                           step=1.0)
-                            }
-                        )
+                        needs_creation = edited_market_df[
+                            edited_market_df["Selected DB Product"] == "++ Create New Product ++"]
 
-                        if st.button("💾 Save Sales Line Items Changes", type="primary"):
+                        if not needs_creation.empty:
+                            import_names_to_create = needs_creation["ImportName"].unique().tolist()
+                            define_new_products_dialog(import_names_to_create)
+                        else:
+                            with st.spinner("Saving mappings and aggregating order items..."):
+                                edited_market_df['FinalProductID'] = edited_market_df[
+                                    'Selected DB Product'].map(
+                                    display_to_id)
+
+                                for _, row in edited_market_df.iterrows():
+                                    csv_name = row['ImportName']
+                                    p_id = row['FinalProductID']
+                                    if pd.notna(csv_name) and str(csv_name).strip() != "" and pd.notna(
+                                            p_id):
+                                        save_product_mapping(str(csv_name).strip(), str(p_id))
+
+                                aggregated_df = edited_market_df.groupby('FinalProductID').agg({
+                                    'BaseQuantitySold': 'sum',
+                                    'SalePrice': 'sum'
+                                }).reset_index()
+
+                                try:
+                                    c_id = get_or_create_customer(new_customer)
+                                    get_or_create_order(new_order_id, c_id, str(new_date_placed),
+                                                        str(new_date_fulfilled))
+
+                                    for _, row in aggregated_df.iterrows():
+                                        create_sale(new_order_id, row['FinalProductID'],
+                                                    float(row['BaseQuantitySold']),
+                                                    float(row['SalePrice']))
+
+                                    st.success(
+                                        f"🎉 Successfully created order `{new_order_id}` with {len(aggregated_df)} combined line items!")
+
+                                    del st.session_state["market_draft_df"]
+                                    del st.session_state["market_csv_name"]
+
+                                    if st.button("Return to Order Manager"):
+                                        st.rerun()
+
+                                except Exception as e:
+                                    st.error(f"Database error while saving order: {e}")
+
+        # -------------------------------------------------------------------------
+        # MODE 2: SEARCH & EDIT EXISTING ORDERS
+        # -------------------------------------------------------------------------
+        else:
+            st.subheader("✏️ Search & Edit Existing Registered Orders")
+
+            conn = sqlite3.connect(DB_FILENAME)
+            registered_orders_df = pd.read_sql_query('''
+                            SELECT o.OrderID, c.Name AS CustomerName, o.DatePlaced, o.DateFullfilled 
+                            FROM Orders o
+                            JOIN Customers c ON o.CustomerID = c.CustomerID
+                            ORDER BY o.DateFullfilled DESC
+                        ''', conn)
+
+            registered_orders_df['DateFullfilled_Obj'] = pd.to_datetime(
+                registered_orders_df['DateFullfilled'],
+                errors='coerce',
+                format='mixed'
+            ).dt.date
+            registered_orders_df['DateFullfilled_Obj'] = registered_orders_df[
+                'DateFullfilled_Obj'].fillna(
+                registered_orders_df['DateFullfilled']
+            )
+
+            order_products_df = pd.read_sql_query('''
+                            SELECT s.OrderID, p.Name AS ProductName
+                            FROM Sales s
+                            JOIN Products p ON s.ProductID = p.ProductID
+                        ''', conn)
+            conn.close()
+
+            if registered_orders_df.empty:
+                st.info("No orders registered in the database yet.")
+            else:
+                st.markdown("### 🔍 Search & Filter Orders")
+
+                f_col1, f_col2, f_col3 = st.columns(3)
+
+                all_order_dates = sorted(
+                    registered_orders_df['DateFullfilled_Obj'].dropna().unique().tolist(),
+                    reverse=True, key=str)
+                search_dates = f_col1.multiselect("Filter by Date Fulfilled", all_order_dates,
+                                                  default=[],
+                                                  key="search_edit_date")
+
+                all_sold_products = sorted(order_products_df['ProductName'].dropna().unique().tolist())
+                search_products = f_col2.multiselect("Filter by Product Contained", all_sold_products,
+                                                     default=[],
+                                                     key="search_edit_prod")
+
+                all_order_customers = sorted(
+                    registered_orders_df['CustomerName'].dropna().unique().tolist())
+                search_customers = f_col3.multiselect("Filter by Customer", all_order_customers,
+                                                      default=[],
+                                                      key="search_edit_cust")
+
+                valid_order_ids = registered_orders_df['OrderID'].tolist()
+
+                if search_dates:
+                    registered_orders_df = registered_orders_df[
+                        registered_orders_df['DateFullfilled_Obj'].isin(search_dates)]
+                    valid_order_ids = registered_orders_df['OrderID'].tolist()
+
+                if search_customers:
+                    registered_orders_df = registered_orders_df[
+                        registered_orders_df['CustomerName'].isin(search_customers)]
+                    valid_order_ids = registered_orders_df['OrderID'].tolist()
+
+                if search_products:
+                    matched_orders = \
+                    order_products_df[order_products_df['ProductName'].isin(search_products)][
+                        'OrderID'].unique()
+                    valid_order_ids = [oid for oid in valid_order_ids if oid in matched_orders]
+                    registered_orders_df = registered_orders_df[
+                        registered_orders_df['OrderID'].isin(valid_order_ids)]
+
+                st.divider()
+
+                if not valid_order_ids:
+                    st.warning("No orders match the selected filters.")
+                else:
+                    def format_reg_order(o_id):
+                        row = registered_orders_df[registered_orders_df['OrderID'] == o_id].iloc[0]
+                        return f"Order {o_id} | {row['CustomerName']} | Fulfilled: {row['DateFullfilled']}"
+
+
+                    selected_reg_order = st.selectbox("Select Registered Order to Edit",
+                                                      valid_order_ids,
+                                                      format_func=format_reg_order)
+
+                    if selected_reg_order:
+                        conn = sqlite3.connect(DB_FILENAME)
+                        order_header = pd.read_sql_query('SELECT * FROM Orders WHERE OrderID = ?', conn,
+                                                         params=(selected_reg_order,)).iloc[0]
+                        sales_items_df = pd.read_sql_query('''
+                                        SELECT s.SaleID, s.ProductID, p.Name AS ProductName, s.BaseQuantitySold, s.SalePrice
+                                        FROM Sales s
+                                        JOIN Products p ON s.ProductID = p.ProductID
+                                        WHERE s.OrderID = ?
+                                    ''', conn, params=(selected_reg_order,))
+                        conn.close()
+
+                        all_cust_df = get_all_customers()
+                        cust_names = all_cust_df['Name'].tolist()
+                        current_cust_row = all_cust_df[
+                            all_cust_df['CustomerID'] == order_header['CustomerID']]
+                        current_cust_name = current_cust_row.iloc[0][
+                            'Name'] if not current_cust_row.empty else (
+                            cust_names[0] if cust_names else "Market")
+
+                        st.subheader(f"Editing Order: {selected_reg_order}")
+
+                        with st.form("edit_order_header_form"):
+                            ec1, ec2, ec3 = st.columns(3)
+                            new_cust_name = ec1.selectbox("Customer",
+                                                          cust_names if cust_names else ["Market"],
+                                                          index=cust_names.index(
+                                                              current_cust_name) if cust_names and current_cust_name in cust_names else 0)
+
+                            val_dp = safe_parse_date(order_header['DatePlaced'])
+                            val_df = safe_parse_date(order_header['DateFullfilled'])
+                            new_date_placed = ec2.date_input("Date Placed", value=val_dp)
+                            new_date_fulfilled = ec3.date_input("Date Fulfilled", value=val_df)
+
+                            update_header_btn = st.form_submit_button("💾 Update Order Details")
+                            if update_header_btn:
+                                try:
+                                    c_id = get_or_create_customer(new_cust_name)
+                                    get_or_create_order(selected_reg_order, c_id, str(new_date_placed),
+                                                        str(new_date_fulfilled))
+                                    st.success("Order header details updated successfully!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error updating order: {e}")
+
+                        st.markdown("#### Sales Line Items in this Order")
+                        if sales_items_df.empty:
+                            st.warning("No sales items found for this order.")
+                        else:
+                            edited_sales_df = st.data_editor(
+                                sales_items_df,
+                                num_rows="dynamic",
+                                use_container_width=True,
+                                key="sales_editor",
+                                column_config={
+                                    "SaleID": st.column_config.NumberColumn("Sale ID", disabled=True),
+                                    "ProductID": st.column_config.TextColumn("Product ID"),
+                                    "ProductName": st.column_config.TextColumn("Product Name"),
+                                    "BaseQuantitySold": st.column_config.NumberColumn("Base Qty Sold",
+                                                                                      step=0.1),
+                                    "SalePrice": st.column_config.NumberColumn("Sale Price ($)",
+                                                                               step=1.0)
+                                }
+                            )
+
+                            if st.button("💾 Save Sales Line Items Changes", type="primary"):
+                                try:
+                                    conn = sqlite3.connect(DB_FILENAME)
+                                    cursor = conn.cursor()
+
+                                    existing_sale_ids = set(sales_items_df['SaleID'].tolist())
+                                    updated_sale_ids = set(edited_sales_df['SaleID'].dropna().tolist())
+
+                                    deleted_ids = existing_sale_ids - updated_sale_ids
+                                    for d_id in deleted_ids:
+                                        cursor.execute("DELETE FROM Sales WHERE SaleID = ?", (d_id,))
+
+                                    for _, row in edited_sales_df.iterrows():
+                                        if pd.notna(row['SaleID']) and row[
+                                            'SaleID'] in existing_sale_ids:
+                                            cursor.execute('''
+                                                            UPDATE Sales 
+                                                            SET ProductID = ?, BaseQuantitySold = ?, SalePrice = ?
+                                                            WHERE SaleID = ?
+                                                        ''', (row['ProductID'], row['BaseQuantitySold'],
+                                                              row['SalePrice'], row['SaleID']))
+                                        else:
+                                            cursor.execute('''
+                                                            INSERT INTO Sales (OrderID, ProductID, BaseQuantitySold, SalePrice)
+                                                            VALUES (?, ?, ?, ?)
+                                                        ''', (selected_reg_order, row['ProductID'],
+                                                              row['BaseQuantitySold'],
+                                                              row['SalePrice']))
+
+                                    conn.commit()
+                                    conn.close()
+                                    st.success("Sales items updated successfully!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error saving sales items: {e}")
+
+                        st.divider()
+                        if st.button("🗑️ Delete Entire Order", type="secondary"):
                             try:
                                 conn = sqlite3.connect(DB_FILENAME)
                                 cursor = conn.cursor()
-
-                                existing_sale_ids = set(sales_items_df['SaleID'].tolist())
-                                updated_sale_ids = set(edited_sales_df['SaleID'].dropna().tolist())
-
-                                deleted_ids = existing_sale_ids - updated_sale_ids
-                                for d_id in deleted_ids:
-                                    cursor.execute("DELETE FROM Sales WHERE SaleID = ?", (d_id,))
-
-                                for _, row in edited_sales_df.iterrows():
-                                    if pd.notna(row['SaleID']) and row[
-                                        'SaleID'] in existing_sale_ids:
-                                        cursor.execute('''
-                                                        UPDATE Sales 
-                                                        SET ProductID = ?, BaseQuantitySold = ?, SalePrice = ?
-                                                        WHERE SaleID = ?
-                                                    ''', (row['ProductID'], row['BaseQuantitySold'],
-                                                          row['SalePrice'], row['SaleID']))
-                                    else:
-                                        cursor.execute('''
-                                                        INSERT INTO Sales (OrderID, ProductID, BaseQuantitySold, SalePrice)
-                                                        VALUES (?, ?, ?, ?)
-                                                    ''', (selected_reg_order, row['ProductID'],
-                                                          row['BaseQuantitySold'],
-                                                          row['SalePrice']))
-
+                                cursor.execute("DELETE FROM Sales WHERE OrderID = ?",
+                                               (selected_reg_order,))
+                                cursor.execute("DELETE FROM Orders WHERE OrderID = ?",
+                                               (selected_reg_order,))
                                 conn.commit()
                                 conn.close()
-                                st.success("Sales items updated successfully!")
+                                st.success(f"Order {selected_reg_order} deleted successfully!")
                                 st.rerun()
                             except Exception as e:
-                                st.error(f"Error saving sales items: {e}")
-
-                    st.divider()
-                    if st.button("🗑️ Delete Entire Order", type="secondary"):
-                        try:
-                            conn = sqlite3.connect(DB_FILENAME)
-                            cursor = conn.cursor()
-                            cursor.execute("DELETE FROM Sales WHERE OrderID = ?",
-                                           (selected_reg_order,))
-                            cursor.execute("DELETE FROM Orders WHERE OrderID = ?",
-                                           (selected_reg_order,))
-                            conn.commit()
-                            conn.close()
-                            st.success(f"Order {selected_reg_order} deleted successfully!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error deleting order: {e}")
+                                st.error(f"Error deleting order: {e}")
