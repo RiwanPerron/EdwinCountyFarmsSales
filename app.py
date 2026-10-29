@@ -429,7 +429,7 @@ def render_sales_filters(df: pd.DataFrame, prefix: str = "") -> Tuple[pd.DataFra
     filtered = base_df[base_df['MonthName'].isin(selected_months)]
 
     pf_col1, pf_col2, pf_col3, pf_col4, pf_col5 = st.columns(5)
-    available_years = sorted(filtered['Year'].unique().tolist(), reverse=True)
+    available_years = [2022,2023,2024,2025,2026,2027]
 
     filter_years = pf_col1.multiselect("Select Years", available_years, default=available_years, key=f"{prefix}_year")
 
@@ -583,6 +583,7 @@ if tab2:
             st.info("No sales records found in the database yet.")
         else:
             yoy_filtered, available_years_analysis = render_sales_filters(analytics_df, prefix="analysis")
+            available_years_analysis = [2022,2023,2024,2025,2026,2027]
 
             if yoy_filtered.empty:
                 st.warning("No sales found for the selected filter criteria.")
@@ -705,7 +706,7 @@ if tab2:
                             ref_series = flat_df[ref_year].replace({0: np.nan})
 
                             # Calculating fractional difference to leverage native percentage format
-                            pct_series = (val_series - ref_series) / ref_series
+                            pct_series = (val_series - ref_series) / ref_series *100
                             matrix_dict[pct_col_name] = pct_series
                             column_configs[pct_col_name] = st.column_config.NumberColumn(
                                 pct_col_name, format="%+.1f%%"
